@@ -255,6 +255,7 @@ class ShardedMixtureDataset(IterableDataset):
         self.curr_shard = None
         self._executor = None
         self._cache_job: Future | None = None
+        self._resume_next_shard_index = 0
 
         self._assert_seed_rank_symmetric(self.seed)
 
@@ -419,7 +420,8 @@ class ShardedMixtureDataset(IterableDataset):
 
         # Initialize worker-specific shard schedule
         self.worker_shard_sampling_schedule = self.filter_shard_sample_schedule()
-        self.curr_shard_index = -1
+        self.curr_shard_index = self._resume_next_shard_index - 1
+        self._resume_next_shard_index = 0
         self.cache_next_shard()
         rng = np.random.default_rng(self.seed + self.epoch)
 
@@ -507,6 +509,42 @@ class ShardedMixtureDataset(IterableDataset):
         self.epoch = 0
         self.shard_sampling_schedule = self.generate_shard_sampling_schedule()
         self.curr_shard_index = -1
+        self.curr_shard = None
+        self._cache_job = None
+        self._resume_next_shard_index = 0
+        self._assert_seed_rank_symmetric(self.seed)
+
+    def state_dict(self) -> dict[str, int]:
+        """Return the next unit-shard cursor used by RoboTTT checkpointing.
+
+        TrajectorySequenceDataset intentionally exposes one trajectory window per
+        shard, so a shard cursor is also an exact sample cursor. Refuse other
+        dataset types instead of claiming a deterministic mid-shard resume.
+        """
+        if not all(
+            dataset.__class__.__name__ == "TrajectorySequenceDataset" for dataset in self.datasets
+        ):
+            raise RuntimeError(
+                "exact sampler state is only supported for trajectory sequence datasets"
+            )
+        return {
+            "seed": int(self.seed),
+            "epoch": int(self.epoch),
+            "next_shard_index": int(getattr(self, "curr_shard_index", -1) + 1),
+        }
+
+    def load_state_dict(self, state: dict[str, int]) -> None:
+        """Restore the exact next trajectory window for a zero-worker loader."""
+        required = {"seed", "epoch", "next_shard_index"}
+        if set(state) != required:
+            raise ValueError(f"invalid sampler state keys: {sorted(state)}")
+        if state["epoch"] < 0 or state["next_shard_index"] < 0:
+            raise ValueError("sampler epoch and cursor must be non-negative")
+        self.seed = int(state["seed"])
+        self.epoch = int(state["epoch"])
+        self.shard_sampling_schedule = self.generate_shard_sampling_schedule()
+        self._resume_next_shard_index = int(state["next_shard_index"])
+        self.curr_shard_index = self._resume_next_shard_index - 1
         self.curr_shard = None
         self._cache_job = None
         self._assert_seed_rank_symmetric(self.seed)

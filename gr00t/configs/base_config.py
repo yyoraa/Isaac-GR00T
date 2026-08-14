@@ -154,6 +154,16 @@ class Config:
 
     def get_deepspeed_config(self) -> dict:
         """Generate DeepSpeed configuration."""
+        if self.training.deepspeed_config_path is not None:
+            path = Path(self.training.deepspeed_config_path)
+            if not path.is_absolute():
+                repository_root = Path(__file__).parent.parent.parent
+                path = repository_root / path
+            if not path.is_file():
+                raise FileNotFoundError(f"DeepSpeed config does not exist: {path}")
+            with path.open() as stream:
+                return json.load(stream)
+
         stage = self.training.deepspeed_stage
 
         gr00t_dir = Path(__file__).parent.parent

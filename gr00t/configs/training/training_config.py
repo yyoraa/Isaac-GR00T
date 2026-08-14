@@ -91,7 +91,14 @@ class TrainingConfig:
 
     # DeepSpeed (default)
     deepspeed_stage: int = 2  # ZeRO stage (1, 2, or 3)
+    deepspeed_config_path: str | None = None
     gradient_checkpointing: bool = False
+
+    # RoboTTT two-stage training. None preserves the standard trainer path.
+    robottt_stage: str | None = None
+    robottt_manifest_hash: str = ""
+    robottt_curriculum_buckets: list[int] = field(default_factory=list)
+    robottt_wsd_decay_steps: int = 1000
 
     # Transformers loading parameters
     transformers_trust_remote_code: bool = True

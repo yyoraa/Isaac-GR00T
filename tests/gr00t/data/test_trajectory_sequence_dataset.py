@@ -80,3 +80,21 @@ def test_collator_pads_time_and_emits_loss_masks():
     assert batch["action_loss_mask"].tolist() == [[True, True, True], [True, False, False]]
     assert batch["episode_reset_mask"].tolist() == [[True, False, False], [True, False, False]]
     assert batch["temporal_positions"].tolist() == [[0, 1, 2], [4, 4, 4]]
+
+
+def test_collator_applies_runtime_curriculum_context():
+    dataset = TrajectorySequenceDataset(
+        episode_loader=_Loader(),
+        step_factory=_step_factory,
+        context_length=5,
+        stride=5,
+        action_horizon=1,
+    )
+    collator = TrajectoryCollator(_BaseCollator())
+    collator.set_context_length(2)
+
+    batch = collator([dataset.get_shard(0)[0]])["inputs"]
+
+    assert batch["value"].shape == (1, 2)
+    assert batch["valid_mask"].tolist() == [[True, True]]
+    assert batch["temporal_positions"].tolist() == [[0, 1]]

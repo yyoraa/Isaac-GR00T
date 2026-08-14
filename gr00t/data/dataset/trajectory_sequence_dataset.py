@@ -134,22 +134,31 @@ class TrajectoryCollator:
 
     def __init__(self, base_collator: Callable[[list[dict[str, Any]]], Any]):
         self.base_collator = base_collator
+        self.context_length: int | None = None
+
+    def set_context_length(self, context_length: int) -> None:
+        if context_length <= 0:
+            raise ValueError("context_length must be positive")
+        self.context_length = context_length
 
     def __call__(self, features: list[dict[str, Any]]) -> BatchFeature:
         if not features:
             raise ValueError("cannot collate an empty trajectory batch")
         batch_size = len(features)
-        max_length = max(int(feature["length"]) for feature in features)
+        lengths = [int(feature["length"]) for feature in features]
+        if self.context_length is not None:
+            lengths = [min(length, self.context_length) for length in lengths]
+        max_length = max(lengths)
         flat_steps = []
         valid_mask = torch.zeros(batch_size, max_length, dtype=torch.bool)
         positions = torch.zeros(batch_size, max_length, dtype=torch.long)
         episode_ids = torch.empty(batch_size, dtype=torch.long)
 
-        for batch_index, feature in enumerate(features):
-            steps = feature["trajectory_steps"]
-            length = int(feature["length"])
-            if length != len(steps) or length <= 0:
+        for batch_index, (feature, length) in enumerate(zip(features, lengths)):
+            all_steps = feature["trajectory_steps"]
+            if int(feature["length"]) != len(all_steps) or length <= 0:
                 raise ValueError("trajectory length does not match trajectory_steps")
+            steps = all_steps[:length]
             padded = list(steps) + [steps[-1]] * (max_length - length)
             flat_steps.extend(padded)
             valid_mask[batch_index, :length] = True

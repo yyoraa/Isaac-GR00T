@@ -1,7 +1,17 @@
+import json
+
 from gr00t.configs.robottt_training import (
     RoboTTTTrainingConfig,
     build_wsd_scheduler,
     set_robottt_stage_trainability,
+)
+from gr00t.data.dataset.sharded_mixture_dataset import ShardedMixtureDataset
+from gr00t.data.dataset.trajectory_sequence_dataset import TrajectorySequenceDataset
+from gr00t.experiment.launch_robottt import RoboTTTLaunchConfig, build_robottt_config
+from gr00t.experiment.robottt_trainer import (
+    ROBOTTT_STATE_NAME,
+    RoboTTTCheckpointState,
+    RoboTTTCurriculum,
 )
 import torch
 from torch import nn
@@ -83,3 +93,90 @@ def test_stage2_rejects_lora_or_non_1024_context():
             pass
         else:
             raise AssertionError(f"invalid Stage 2 config accepted: {kwargs}")
+
+
+def test_curriculum_and_checkpoint_state_round_trip(tmp_path):
+    curriculum = RoboTTTCurriculum((128, 512, 1024, 2048, 4096, 8192), 30_000)
+    assert curriculum.bucket_for_step(0) == (0, 128)
+    assert curriculum.bucket_for_step(5_000) == (1, 512)
+    assert curriculum.bucket_for_step(29_999) == (5, 8192)
+
+    state = RoboTTTCheckpointState(
+        stage="stage1",
+        global_step=5_000,
+        curriculum_bucket=1,
+        context_length=512,
+        manifest_sha256="a" * 64,
+        sampler_state={"seed": 42, "epoch": 3, "cursor": 17},
+    )
+    state.save(tmp_path)
+    restored = RoboTTTCheckpointState.load(tmp_path)
+
+    assert restored == state
+    assert json.loads((tmp_path / ROBOTTT_STATE_NAME).read_text())["sampler_state"]["cursor"] == 17
+    restored.validate(stage="stage1", manifest_sha256="a" * 64)
+
+
+def test_resume_state_rejects_stage_or_manifest_mismatch(tmp_path):
+    state = RoboTTTCheckpointState(
+        stage="stage1",
+        global_step=1,
+        curriculum_bucket=0,
+        context_length=128,
+        manifest_sha256="b" * 64,
+        sampler_state={},
+    )
+    state.save(tmp_path)
+    restored = RoboTTTCheckpointState.load(tmp_path)
+
+    for kwargs in (
+        {"stage": "stage2", "manifest_sha256": "b" * 64},
+        {"stage": "stage1", "manifest_sha256": "c" * 64},
+    ):
+        try:
+            restored.validate(**kwargs)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"incompatible resume state accepted: {kwargs}")
+
+
+def test_launcher_maps_stage2_to_full_tuning_and_single_gpu_zero3(tmp_path):
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text('{"episode_id": "ep-1"}\n')
+    launch = RoboTTTLaunchConfig(
+        stage="stage2",
+        base_model_path="stage1-checkpoint",
+        dataset_path="robocasa365-lerobot",
+        manifest_path=str(manifest),
+        embodiment_tag="panda_omron",
+    )
+
+    config = build_robottt_config(launch)
+
+    assert config.model.robottt_enabled is True
+    assert config.data.sequence_mode is True
+    assert config.data.context_length == 1024
+    assert config.training.robottt_stage == "stage2"
+    assert config.training.max_steps == 20_000
+    assert config.training.learning_rate == 5e-5
+    assert config.training.deepspeed_config_path.endswith("robottt_zero3_offload.json")
+    assert config.training.num_gpus == 1
+    assert config.training.robottt_manifest_hash
+
+
+def test_trajectory_sampler_state_restores_exact_next_shard():
+    mixture = ShardedMixtureDataset.__new__(ShardedMixtureDataset)
+    mixture.datasets = [TrajectorySequenceDataset.__new__(TrajectorySequenceDataset)]
+    mixture.seed = 42
+    mixture.epoch = 3
+    mixture.curr_shard_index = 16
+    mixture.world_size = 1
+    mixture.generate_shard_sampling_schedule = lambda: [(0, index) for index in range(100)]
+
+    state = mixture.state_dict()
+    mixture.load_state_dict(state)
+
+    assert state == {"seed": 42, "epoch": 3, "next_shard_index": 17}
+    assert mixture.curr_shard_index == 16
+    assert mixture._resume_next_shard_index == 17

@@ -28,7 +28,9 @@ from transformers import TrainingArguments, set_seed
 import wandb
 
 from gr00t.configs.base_config import Config
+from gr00t.configs.robottt_training import set_robottt_stage_trainability
 from gr00t.configs.training.training_config import check_resume_compatibility
+from gr00t.experiment.robottt_trainer import RoboTTTCurriculum, RoboTTTTrainer
 
 # Use custom trainer that profiles data loading & forward times
 from gr00t.experiment.trainer import Gr00tTrainer, ProfCallback
@@ -248,6 +250,8 @@ def run(config: Config):
     pipeline = MODEL_REGISTRY.get(type(config.model))(config, save_cfg_dir)
     pipeline.setup()
     model = pipeline.return_model()
+    if config.training.robottt_stage is not None:
+        set_robottt_stage_trainability(model, config.training.robottt_stage)
     train_dataset, eval_dataset = pipeline.return_dataset()
     data_collator = pipeline.return_collator()
     processor = pipeline.return_processor()
@@ -256,7 +260,9 @@ def run(config: Config):
     run_on_rank0(processor.save_pretrained, processor_dir, label="processor.save_pretrained")
 
     # deepspeed config
-    if config.training.num_gpus > 1 and not config.training.use_ddp:
+    if config.training.deepspeed_config_path is not None or (
+        config.training.num_gpus > 1 and not config.training.use_ddp
+    ):
         deepspeed_config = config.get_deepspeed_config()
     else:
         deepspeed_config = None
@@ -303,13 +309,26 @@ def run(config: Config):
     )
 
     # Create trainer
-    trainer = Gr00tTrainer(
+    trainer_class = RoboTTTTrainer if config.training.robottt_stage is not None else Gr00tTrainer
+    robottt_trainer_kwargs = {}
+    if config.training.robottt_stage is not None:
+        robottt_trainer_kwargs = {
+            "robottt_stage": config.training.robottt_stage,
+            "robottt_manifest_hash": config.training.robottt_manifest_hash,
+            "robottt_curriculum": RoboTTTCurriculum(
+                tuple(config.training.robottt_curriculum_buckets),
+                config.training.max_steps,
+            ),
+            "robottt_wsd_decay_steps": config.training.robottt_wsd_decay_steps,
+        }
+    trainer = trainer_class(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
         multiprocessing_context=config.data.multiprocessing_context,
+        **robottt_trainer_kwargs,
     )
 
     trainer.add_callback(
