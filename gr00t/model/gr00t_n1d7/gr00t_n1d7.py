@@ -820,7 +820,11 @@ class Gr00tN1d7(PreTrainedModel):
 
         return backbone_inputs, action_inputs
 
-    def forward(self, inputs: dict) -> BatchFeature:
+    def forward(
+        self,
+        inputs: dict,
+        robottt_state: RoboTTTState | None = None,
+    ) -> BatchFeature:
         """
         Forward pass through the complete model.
 
@@ -847,6 +851,7 @@ class Gr00tN1d7(PreTrainedModel):
             action_outputs = self.action_head.forward_sequence(
                 backbone_outputs,
                 action_inputs,
+                robottt_state=robottt_state,
                 tbptt_steps=getattr(self.config, "robottt_tbptt_steps", 128),
             )
         else:

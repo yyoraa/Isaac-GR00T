@@ -12,6 +12,7 @@ from gr00t.experiment.robottt_trainer import (
     ROBOTTT_STATE_NAME,
     RoboTTTCheckpointState,
     RoboTTTCurriculum,
+    RoboTTTTrainer,
 )
 import torch
 from torch import nn
@@ -180,3 +181,23 @@ def test_trajectory_sampler_state_restores_exact_next_shard():
     assert state == {"seed": 42, "epoch": 3, "next_shard_index": 17}
     assert mixture.curr_shard_index == 16
     assert mixture._resume_next_shard_index == 17
+
+
+def test_tbptt_slicer_preserves_temporal_and_flat_vlm_alignment():
+    inputs = {
+        "inputs": {
+            "trajectory_shape": torch.tensor([1, 4]),
+            "state": torch.arange(4).reshape(1, 4, 1),
+            "input_ids": torch.arange(4).reshape(4, 1),
+            "pixel_values": torch.arange(8).reshape(8, 1),
+            "episode_id": torch.tensor([9]),
+        }
+    }
+
+    segment = RoboTTTTrainer._slice_trajectory_inputs(inputs, 1, 3)["inputs"]
+
+    assert segment["trajectory_shape"].tolist() == [1, 2]
+    assert segment["state"].flatten().tolist() == [1, 2]
+    assert segment["input_ids"].flatten().tolist() == [1, 2]
+    assert segment["pixel_values"].flatten().tolist() == [2, 3, 4, 5]
+    assert segment["episode_id"].tolist() == [9]

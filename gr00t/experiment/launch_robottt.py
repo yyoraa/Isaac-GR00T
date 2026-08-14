@@ -33,6 +33,7 @@ class RoboTTTLaunchConfig:
     save_total_limit: int = 5
     use_wandb: bool = False
     dataloader_num_workers: int = 0
+    tbptt_steps: int = 1
 
 
 def _manifest_sha256(path: str | Path) -> str:
@@ -76,7 +77,9 @@ def build_robottt_config(launch: RoboTTTLaunchConfig) -> Config:
     config.model.robottt_inner_lr = 0.1
     config.model.robottt_rope_theta = 10_000.0
     config.model.robottt_gate_init = 0.001
-    config.model.robottt_tbptt_steps = preset.tbptt_steps
+    if launch.tbptt_steps <= 0:
+        raise ValueError("tbptt_steps must be positive")
+    config.model.robottt_tbptt_steps = launch.tbptt_steps
     config.model.model_name = "nvidia/Cosmos-Reason2-2B"
     config.model.load_bf16 = False
     config.model.backbone_trainable_params_fp32 = True
@@ -85,7 +88,7 @@ def build_robottt_config(launch: RoboTTTLaunchConfig) -> Config:
     config.data.sequence_mode = True
     config.data.context_length = preset.context_length
     config.data.sequence_stride = preset.context_length
-    config.data.tbptt_steps = preset.tbptt_steps
+    config.data.tbptt_steps = launch.tbptt_steps
 
     config.training.start_from_checkpoint = launch.base_model_path
     config.training.output_dir = launch.output_dir

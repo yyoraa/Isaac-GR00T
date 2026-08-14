@@ -9,6 +9,7 @@ import math
 from pathlib import Path
 from typing import Any
 
+import torch
 from transformers.trainer import get_last_checkpoint
 from transformers.trainer_callback import TrainerCallback
 
@@ -120,6 +121,74 @@ class RoboTTTTrainer(Gr00tTrainer):
             )
             self._created_lr_scheduler = True
         return self.lr_scheduler
+
+    @staticmethod
+    def _slice_trajectory_inputs(inputs: dict[str, Any], start: int, end: int) -> dict[str, Any]:
+        payload = inputs["inputs"]
+        batch_size, trajectory_length = [int(value) for value in payload["trajectory_shape"]]
+        segment_length = end - start
+        sliced = {}
+        for key, value in payload.items():
+            if key == "trajectory_shape":
+                sliced[key] = value.new_tensor([batch_size, segment_length])
+            elif (
+                isinstance(value, torch.Tensor)
+                and value.ndim >= 2
+                and tuple(value.shape[:2])
+                == (
+                    batch_size,
+                    trajectory_length,
+                )
+            ):
+                sliced[key] = value[:, start:end]
+            elif (
+                isinstance(value, torch.Tensor)
+                and value.ndim >= 1
+                and value.shape[0] % (batch_size * trajectory_length) == 0
+                and value.shape[0] != batch_size
+            ):
+                multiplicity = value.shape[0] // (batch_size * trajectory_length)
+                reshaped = value.reshape(
+                    batch_size, trajectory_length, multiplicity, *value.shape[1:]
+                )
+                sliced[key] = reshaped[:, start:end].reshape(
+                    batch_size * segment_length * multiplicity, *value.shape[1:]
+                )
+            else:
+                sliced[key] = value
+        return {"inputs": sliced}
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        payload = inputs.get("inputs", {})
+        if "trajectory_shape" not in payload:
+            return super().training_step(model, inputs, num_items_in_batch)
+
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+        _, trajectory_length = [int(value) for value in inputs["inputs"]["trajectory_shape"]]
+        segment_length = int(getattr(model.config, "robottt_tbptt_steps", 1))
+        fast_state = None
+        reported_loss = torch.zeros((), device=self.args.device)
+        for start in range(0, trajectory_length, segment_length):
+            end = min(start + segment_length, trajectory_length)
+            segment = self._slice_trajectory_inputs(inputs, start, end)
+            segment["robottt_state"] = fast_state
+            with self.compute_loss_context_manager():
+                loss, outputs = self.compute_loss(
+                    model,
+                    segment,
+                    return_outputs=True,
+                    num_items_in_batch=num_items_in_batch,
+                )
+            weight = (end - start) / trajectory_length
+            scaled_loss = loss * weight / self.current_gradient_accumulation_steps
+            kwargs = {}
+            if self.accelerator.distributed_type.value == "DEEPSPEED":
+                kwargs["scale_wrt_gas"] = False
+            self.accelerator.backward(scaled_loss, **kwargs)
+            reported_loss = reported_loss + loss.detach() * weight
+            fast_state = outputs.robottt_state.detach()
+        return reported_loss
 
     def save_robottt_state(self, global_step: int) -> None:
         if not self.args.should_save:
