@@ -150,6 +150,7 @@ logs_*/
 
 # Git worktrees
 /wt
+/.worktrees/
 
 # General project data / artifacts
 episode_data/
