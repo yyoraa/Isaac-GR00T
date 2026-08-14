@@ -33,6 +33,8 @@
 
 ## NVIDIA Isaac GR00T
 
+> **RoboTTT reproduction:** This branch includes a public GR00T N1.7 + RoboTTT implementation and a disk-safe RoboCasa365 workflow. See [docs/robottt-robocasa365.md](docs/robottt-robocasa365.md) for the exact architecture, data manifest, two-stage training, resume, evaluation, and verification commands.
+
 <table style="width:100%; table-layout:fixed;">
   <tr>
     <td style="width:33.33%; text-align:center;">
