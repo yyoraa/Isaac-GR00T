@@ -111,3 +111,13 @@ def test_fast_state_carries_between_observations_and_reset_clears_it():
     head.reset_robottt_state()
     assert head.robottt_fast_state is None
     assert head.robottt_observation_count == 0
+
+
+def test_update_off_ablation_runs_architecture_without_fast_updates():
+    head, capture, backbone, action = _head_and_inputs()
+    head.set_robottt_online_updates(False)
+
+    head.get_action(backbone, action)
+
+    assert capture.update_masks == [False, False, False, False]
+    assert head.robottt_fast_state.generation == 0

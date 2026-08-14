@@ -79,6 +79,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         self._robottt_fast_state: RoboTTTState | None = None
         self._robottt_observation_count = 0
         self._robottt_batch_size: int | None = None
+        self._robottt_online_updates_enabled = True
 
         self.state_encoder = CategorySpecificMLP(
             num_categories=config.max_num_embodiments,
@@ -208,6 +209,11 @@ class Gr00tN1d7ActionHead(nn.Module):
         self._robottt_fast_state = None
         self._robottt_observation_count = 0
         self._robottt_batch_size = None
+
+    def set_robottt_online_updates(self, enabled: bool) -> None:
+        """Toggle fast-weight updates while retaining the RoboTTT architecture."""
+        self.reset_robottt_state()
+        self._robottt_online_updates_enabled = bool(enabled)
 
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
         backbone_features = backbone_output["backbone_features"]
@@ -633,7 +639,10 @@ class Gr00tN1d7ActionHead(nn.Module):
                         ),
                         valid_mask=torch.ones(batch_size, 1, dtype=torch.bool, device=device),
                         update_mask=torch.full(
-                            (batch_size, 1), t == 0, dtype=torch.bool, device=device
+                            (batch_size, 1),
+                            t == 0 and self._robottt_online_updates_enabled,
+                            dtype=torch.bool,
+                            device=device,
                         ),
                     )
                     model_output = model_output[:, 0]

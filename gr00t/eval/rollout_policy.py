@@ -386,6 +386,10 @@ def _collect_rollout_episodes(
                     # static type silently flips int <-> float across iterations.
                     current_rewards[env_idx] = 0.0
                     current_lengths[env_idx] = 0
+            if np.any(terminations) or np.any(truncations):
+                # RoboTTT fast weights are episode-local. Current policy state
+                # is batch-wide, so stateful evaluation uses n_envs=1.
+                policy.reset()
             observations = next_obs
 
         # Best-effort: a failed final reset must not skip the caller's env.close().
@@ -394,6 +398,8 @@ def _collect_rollout_episodes(
         except Exception as reset_err:
             print(f"Final env.reset() before close failed; closing env anyway: {reset_err}")
     finally:
+        # Clear transient fast weights on success, timeout, or simulator error.
+        policy.reset()
         pbar.close()
 
     return episode_successes, episode_lengths, episode_rewards, episode_infos

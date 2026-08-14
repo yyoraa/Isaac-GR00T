@@ -19,6 +19,8 @@ import sys
 import types
 
 from gr00t.eval import rollout_policy
+import numpy as np
+import pytest
 
 
 def test_robocasa365_env_fn_passes_split_to_gym_make(monkeypatch):
@@ -57,3 +59,29 @@ def test_robocasa365_record_video_keys_match_observation_keys():
         "video.robot0_agentview_right",
         "video.robot0_eye_in_hand",
     )
+
+
+def test_rollout_resets_stateful_policy_even_when_simulator_raises():
+    class _Policy:
+        def __init__(self):
+            self.reset_count = 0
+
+        def reset(self):
+            self.reset_count += 1
+
+        def get_action(self, observations):
+            return np.zeros((1, 1)), {}
+
+    class _FailingEnv:
+        def reset(self, **kwargs):
+            return {"state": np.zeros((1, 1))}, {}
+
+        def step(self, actions):
+            raise RuntimeError("simulator failed")
+
+    policy = _Policy()
+
+    with pytest.raises(RuntimeError, match="simulator failed"):
+        rollout_policy._collect_rollout_episodes(_FailingEnv(), policy, 1, 1, None)
+
+    assert policy.reset_count == 2

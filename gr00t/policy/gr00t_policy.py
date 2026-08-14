@@ -488,6 +488,10 @@ class Gr00tPolicy(BasePolicy):
         Returns:
             Dictionary containing the info after resetting the policy
         """
+        action_head = getattr(self.model, "action_head", None)
+        reset_robottt_state = getattr(action_head, "reset_robottt_state", None)
+        if reset_robottt_state is not None:
+            reset_robottt_state()
         return {}
 
 
