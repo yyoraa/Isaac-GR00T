@@ -109,6 +109,15 @@ class Gr00tN1d7Config(PretrainedConfig):
     noise_s: float = 0.999
     num_timestep_buckets: int = 1000
 
+    # RoboTTT sequence adaptation. Disabled by default so public N1.7
+    # checkpoints retain their original single-step behavior.
+    robottt_enabled: bool = False
+    robottt_num_register_tokens: int = 16
+    robottt_inner_dim: int = 3072
+    robottt_inner_lr: float = 0.1
+    robottt_rope_theta: float = 10000.0
+    robottt_gate_init: float = 0.001
+
     # Training parameters
     tune_projector: bool = True
     tune_diffusion_model: bool = True
