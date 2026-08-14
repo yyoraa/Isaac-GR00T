@@ -142,6 +142,9 @@ class EmbodimentTag(Enum):
     Uses the custom-embodiment finetuning projector slot.
     """
 
+    ROBOCASA365_PANDA_OMRON = "robocasa365_panda_omron"
+    """RoboCasa365 PandaOmron with the official LeRobot v3 schema."""
+
     @classmethod
     def resolve(cls, tag: "str | EmbodimentTag") -> "EmbodimentTag":
         """Resolve a string to an EmbodimentTag, case-insensitively.
@@ -218,6 +221,7 @@ FINETUNE_ONLY_TAGS: frozenset[EmbodimentTag] = frozenset(
     {
         EmbodimentTag.NEW_EMBODIMENT,
         EmbodimentTag.ROBOCASA_PANDA_OMRON,
+        EmbodimentTag.ROBOCASA365_PANDA_OMRON,
         EmbodimentTag.ROBOCASA_GR1_TABLETOP,
     }
 )

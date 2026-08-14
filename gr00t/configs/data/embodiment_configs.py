@@ -285,6 +285,40 @@ MODALITY_CONFIGS = {
             modality_keys=["annotation.human.action.task_description"],
         ),
     },
+    "robocasa365_panda_omron": {
+        "video": ModalityConfig(
+            delta_indices=[0],
+            modality_keys=[
+                "robot0_agentview_left",
+                "robot0_agentview_right",
+                "robot0_eye_in_hand",
+            ],
+        ),
+        "state": ModalityConfig(
+            delta_indices=[0],
+            modality_keys=[
+                "base_position",
+                "base_rotation",
+                "end_effector_position_relative",
+                "end_effector_rotation_relative",
+                "gripper_qpos",
+            ],
+        ),
+        "action": ModalityConfig(
+            delta_indices=list(range(16)),
+            modality_keys=[
+                "base_motion",
+                "control_mode",
+                "end_effector_position",
+                "end_effector_rotation",
+                "gripper_close",
+            ],
+        ),
+        "language": ModalityConfig(
+            delta_indices=[0],
+            modality_keys=["annotation.human.task_description"],
+        ),
+    },
     "robocasa_gr1_tabletop": {
         "video": ModalityConfig(
             delta_indices=[0],

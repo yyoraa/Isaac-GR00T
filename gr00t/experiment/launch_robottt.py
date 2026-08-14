@@ -24,7 +24,7 @@ class RoboTTTLaunchConfig:
     base_model_path: str
     dataset_path: str
     manifest_path: str
-    embodiment_tag: str = "robocasa_panda_omron"
+    embodiment_tag: str = "robocasa365_panda_omron"
     output_dir: str = "./outputs/robottt-robocasa365"
     experiment_name: str | None = None
     resume_from_checkpoint: bool = False
@@ -50,7 +50,7 @@ def _manifest_sha256(path: str | Path) -> str:
 def build_robottt_config(launch: RoboTTTLaunchConfig) -> Config:
     preset = RoboTTTTrainingConfig.for_stage(launch.stage)
     tag_name = (
-        "robocasa_panda_omron"
+        "robocasa365_panda_omron"
         if launch.embodiment_tag.lower() == "panda_omron"
         else launch.embodiment_tag
     )
@@ -61,7 +61,9 @@ def build_robottt_config(launch: RoboTTTLaunchConfig) -> Config:
                 "download_cache": False,
                 "datasets": [
                     {
-                        "dataset_paths": [launch.dataset_path],
+                        "dataset_paths": [
+                            path for path in launch.dataset_path.split(os.pathsep) if path
+                        ],
                         "mix_ratio": 1.0,
                         "embodiment_tag": embodiment,
                     }

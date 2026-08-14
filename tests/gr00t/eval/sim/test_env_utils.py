@@ -107,7 +107,7 @@ class TestGetEmbodimentTagFromEnvName:
 
     def test_robocasa365_panda_omron_maps_to_dedicated_tag(self):
         env_name = "robocasa365_panda_omron/CloseFridge_PandaOmron_Env"
-        assert get_embodiment_tag_from_env_name(env_name) == EmbodimentTag.ROBOCASA_PANDA_OMRON
+        assert get_embodiment_tag_from_env_name(env_name) == EmbodimentTag.ROBOCASA365_PANDA_OMRON
 
     # --- Edge cases ---
 
