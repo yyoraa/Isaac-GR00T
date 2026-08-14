@@ -76,6 +76,9 @@ class Gr00tN1d7ActionHead(nn.Module):
             nn.init.normal_(self.register_tokens, mean=0.0, std=0.02)
         else:
             self.register_parameter("register_tokens", None)
+        self._robottt_fast_state: RoboTTTState | None = None
+        self._robottt_observation_count = 0
+        self._robottt_batch_size: int | None = None
 
         self.state_encoder = CategorySpecificMLP(
             num_categories=config.max_num_embodiments,
@@ -190,6 +193,21 @@ class Gr00tN1d7ActionHead(nn.Module):
         """Sample independent flow times for every robot timestep."""
         sample = self.beta_dist.sample([batch_size, trajectory_length]).to(device, dtype=dtype)
         return ((1 - sample) * self.config.noise_s)[:, :, None, None]
+
+    @property
+    def robottt_fast_state(self) -> RoboTTTState | None:
+        """Current rollout-local fast state, exposed for diagnostics."""
+        return self._robottt_fast_state
+
+    @property
+    def robottt_observation_count(self) -> int:
+        return self._robottt_observation_count
+
+    def reset_robottt_state(self) -> None:
+        """Reset online adaptation at an episode boundary."""
+        self._robottt_fast_state = None
+        self._robottt_observation_count = 0
+        self._robottt_batch_size = None
 
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
         backbone_features = backbone_output["backbone_features"]
@@ -572,6 +590,11 @@ class Gr00tN1d7ActionHead(nn.Module):
                 :,
             ] = ramp[None, :, None].to(device)
 
+        candidate_robottt_state = self._robottt_fast_state
+        if self.config.robottt_enabled and self._robottt_batch_size not in (None, batch_size):
+            self.reset_robottt_state()
+            candidate_robottt_state = None
+
         # Run denoising steps.
         for t in range(self.num_inference_timesteps):
             t_cont = t / float(self.num_inference_timesteps)  # e.g. goes 0, 1/N, 2/N, ...
@@ -588,18 +611,40 @@ class Gr00tN1d7ActionHead(nn.Module):
                 pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
                 action_features = action_features + pos_embs
 
-            # Join vision, language, state and action embedding along sequence dimension.
-            sa_embs = torch.cat((state_features, action_features), dim=1)
+            # Join registers, state, and action embeddings along sequence dimension.
+            if self.config.robottt_enabled:
+                registers = self.register_tokens.unsqueeze(0).expand(batch_size, -1, -1)
+                sa_embs = torch.cat((registers, state_features, action_features), dim=1)
+            else:
+                sa_embs = torch.cat((state_features, action_features), dim=1)
 
             # Run model forward.
             if self.config.use_alternate_vl_dit:
-                model_output = self.model(
-                    hidden_states=sa_embs,
-                    encoder_hidden_states=vl_embeds,
-                    timestep=timesteps_tensor,
-                    image_mask=backbone_output.image_mask,
-                    backbone_attention_mask=backbone_output.backbone_attention_mask,
-                )
+                if self.config.robottt_enabled:
+                    model_output, candidate_robottt_state, _ = self.model(
+                        hidden_states=sa_embs[:, None],
+                        encoder_hidden_states=vl_embeds[:, None],
+                        timestep=timesteps_tensor[:, None],
+                        image_mask=backbone_output.image_mask[:, None],
+                        backbone_attention_mask=backbone_output.backbone_attention_mask[:, None],
+                        robottt_state=candidate_robottt_state,
+                        temporal_positions=torch.full(
+                            (batch_size, 1), self._robottt_observation_count, device=device
+                        ),
+                        valid_mask=torch.ones(batch_size, 1, dtype=torch.bool, device=device),
+                        update_mask=torch.full(
+                            (batch_size, 1), t == 0, dtype=torch.bool, device=device
+                        ),
+                    )
+                    model_output = model_output[:, 0]
+                else:
+                    model_output = self.model(
+                        hidden_states=sa_embs,
+                        encoder_hidden_states=vl_embeds,
+                        timestep=timesteps_tensor,
+                        image_mask=backbone_output.image_mask,
+                        backbone_attention_mask=backbone_output.backbone_attention_mask,
+                    )
             else:
                 model_output = self.model(
                     hidden_states=sa_embs,
@@ -612,6 +657,11 @@ class Gr00tN1d7ActionHead(nn.Module):
 
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity * vel_strength
+
+        if self.config.robottt_enabled:
+            self._robottt_fast_state = candidate_robottt_state.detach()
+            self._robottt_observation_count += 1
+            self._robottt_batch_size = batch_size
 
         return BatchFeature(
             data={

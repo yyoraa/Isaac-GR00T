@@ -120,7 +120,8 @@ class RoboTTTLayer(nn.Module):
             raise ValueError(f"batch_size must be positive, got {batch_size}")
 
         def expand(value: torch.Tensor) -> torch.Tensor:
-            return value.unsqueeze(0).expand(batch_size, *value.shape).clone()
+            with torch.enable_grad():
+                return value.unsqueeze(0).expand(batch_size, *value.shape).clone()
 
         return FastMLPState(
             w1=expand(self.w0_w1),
