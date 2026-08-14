@@ -66,6 +66,17 @@ class FastMLPState:
         return FastMLPState(*(detach_tensor(value) for value in self.tensors()))
 
 
+@dataclass(frozen=True)
+class RoboTTTState:
+    """Fast states for all action-transformer layers."""
+
+    layers: tuple[FastMLPState, ...]
+
+    def detach(self) -> RoboTTTState:
+        """Truncate temporal history for every layer at a TBPTT boundary."""
+        return RoboTTTState(tuple(layer.detach() for layer in self.layers))
+
+
 class RoboTTTLayer(nn.Module):
     """One RoboTTT layer with a learned initial fast model."""
 

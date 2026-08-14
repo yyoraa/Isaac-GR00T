@@ -25,6 +25,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from .robottt import FastMLPState, RoboTTTLayer, RoboTTTState
+
 
 def _is_spark_sm121() -> bool:
     if not torch.cuda.is_available():
@@ -118,6 +120,10 @@ class BasicTransformerBlock(nn.Module):
         ff_inner_dim: Optional[int] = None,
         ff_bias: bool = True,
         attention_out_bias: bool = True,
+        robottt_inner_dim: Optional[int] = None,
+        robottt_inner_lr: float = 0.1,
+        robottt_rope_theta: float = 10000.0,
+        robottt_gate_init: float = 0.001,
     ):
         super().__init__()
         self.dim = dim
@@ -177,7 +183,19 @@ class BasicTransformerBlock(nn.Module):
         else:
             self.final_dropout = None
 
-    def forward(
+        self.robottt = (
+            RoboTTTLayer(
+                dim=dim,
+                inner_dim=robottt_inner_dim,
+                inner_lr=robottt_inner_lr,
+                rope_theta=robottt_rope_theta,
+                gate_init=robottt_gate_init,
+            )
+            if robottt_inner_dim is not None
+            else None
+        )
+
+    def forward_attention(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
@@ -185,7 +203,7 @@ class BasicTransformerBlock(nn.Module):
         encoder_attention_mask: Optional[torch.Tensor] = None,
         temb: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
-        # 0. Self-Attention
+        """Run attention and form its residual."""
         if self.norm_type == "ada_norm":
             norm_hidden_states = self.norm1(hidden_states, temb)
         else:
@@ -208,8 +226,10 @@ class BasicTransformerBlock(nn.Module):
         hidden_states = attn_output + hidden_states
         if hidden_states.ndim == 4:
             hidden_states = hidden_states.squeeze(1)
+        return hidden_states
 
-        # 4. Feed-forward
+    def forward_feed_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run the feed-forward sublayer and form its residual."""
         norm_hidden_states = self.norm3(hidden_states)
         ff_output = self.ff(norm_hidden_states)
 
@@ -217,6 +237,66 @@ class BasicTransformerBlock(nn.Module):
         if hidden_states.ndim == 4:
             hidden_states = hidden_states.squeeze(1)
         return hidden_states
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        temb: Optional[torch.LongTensor] = None,
+    ) -> torch.Tensor:
+        hidden_states = self.forward_attention(
+            hidden_states,
+            attention_mask=attention_mask,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            temb=temb,
+        )
+        return self.forward_feed_forward(hidden_states)
+
+    def forward_sequence(
+        self,
+        hidden_states: torch.Tensor,
+        robottt_state: FastMLPState,
+        temporal_positions: torch.Tensor,
+        valid_mask: torch.Tensor,
+        update_mask: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        temb: Optional[torch.LongTensor] = None,
+    ) -> tuple[torch.Tensor, FastMLPState, dict[str, torch.Tensor]]:
+        """Run attention, temporal adaptation, then feed-forward."""
+        if self.robottt is None:
+            raise RuntimeError("forward_sequence requires a RoboTTT-enabled block")
+        if hidden_states.ndim != 4:
+            raise ValueError(
+                "sequence hidden_states must have shape [B,T,N,D], "
+                f"got {tuple(hidden_states.shape)}"
+            )
+
+        batch_size, trajectory_length, num_tokens, dim = hidden_states.shape
+        flattened = hidden_states.reshape(batch_size * trajectory_length, num_tokens, dim)
+        flattened = self.forward_attention(
+            flattened,
+            attention_mask=attention_mask,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            temb=temb,
+        )
+        attended = flattened.reshape(batch_size, trajectory_length, num_tokens, dim)
+        adapted, next_state, metrics = self.robottt.scan(
+            attended,
+            robottt_state,
+            positions=temporal_positions,
+            valid_mask=valid_mask,
+            update_mask=update_mask,
+        )
+        output = self.forward_feed_forward(
+            adapted.reshape(batch_size * trajectory_length, num_tokens, dim)
+        ).reshape(batch_size, trajectory_length, num_tokens, dim)
+        return output, next_state, metrics
 
 
 class DiT(ModelMixin, ConfigMixin):
@@ -243,6 +323,11 @@ class DiT(ModelMixin, ConfigMixin):
         positional_embeddings: Optional[str] = "sinusoidal",
         interleave_self_attention=False,
         cross_attention_dim: Optional[int] = None,
+        robottt_enabled: bool = False,
+        robottt_inner_dim: int = 3072,
+        robottt_inner_lr: float = 0.1,
+        robottt_rope_theta: float = 10000.0,
+        robottt_gate_init: float = 0.001,
     ):
         super().__init__()
 
@@ -276,6 +361,10 @@ class DiT(ModelMixin, ConfigMixin):
                     num_positional_embeddings=self.config.max_num_positional_embeddings,
                     final_dropout=final_dropout,
                     cross_attention_dim=curr_cross_attention_dim,
+                    robottt_inner_dim=robottt_inner_dim if robottt_enabled else None,
+                    robottt_inner_lr=robottt_inner_lr,
+                    robottt_rope_theta=robottt_rope_theta,
+                    robottt_gate_init=robottt_gate_init,
                 )
             ]
         self.transformer_blocks = nn.ModuleList(all_blocks)
@@ -287,6 +376,14 @@ class DiT(ModelMixin, ConfigMixin):
         print(
             "Total number of DiT parameters: ",
             sum(p.numel() for p in self.parameters() if p.requires_grad),
+        )
+
+    def initial_robottt_state(self, batch_size: int) -> RoboTTTState:
+        """Create one fast state per transformer block from learned W0."""
+        if not self.config.robottt_enabled:
+            raise RuntimeError("RoboTTT is disabled for this DiT")
+        return RoboTTTState(
+            tuple(block.robottt.initial_state(batch_size) for block in self.transformer_blocks)
         )
 
     def forward(
@@ -346,6 +443,109 @@ class AlternateVLDiT(DiT):
         super().__init__(*args, **kwargs)
         self.attend_text_every_n_blocks = attend_text_every_n_blocks
 
+    def _forward_robottt_sequence(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: torch.LongTensor,
+        image_mask: torch.Tensor,
+        backbone_attention_mask: torch.Tensor,
+        robottt_state: Optional[RoboTTTState],
+        temporal_positions: torch.Tensor,
+        valid_mask: torch.Tensor,
+        update_mask: torch.Tensor,
+        return_all_hidden_states: bool,
+    ):
+        if hidden_states.ndim != 4:
+            raise ValueError(
+                f"RoboTTT hidden_states must have shape [B,T,N,D], got {tuple(hidden_states.shape)}"
+            )
+        batch_size, trajectory_length, num_tokens, dim = hidden_states.shape
+        expected_time_shape = (batch_size, trajectory_length)
+        for name, value in (
+            ("timestep", timestep),
+            ("temporal_positions", temporal_positions),
+            ("valid_mask", valid_mask),
+            ("update_mask", update_mask),
+        ):
+            if value.shape != expected_time_shape:
+                raise ValueError(
+                    f"{name} must have shape {expected_time_shape}, got {tuple(value.shape)}"
+                )
+        if (
+            encoder_hidden_states.ndim != 4
+            or encoder_hidden_states.shape[:2] != expected_time_shape
+        ):
+            raise ValueError(
+                "encoder_hidden_states must have shape [B,T,S,D], "
+                f"got {tuple(encoder_hidden_states.shape)}"
+            )
+
+        if robottt_state is None:
+            robottt_state = self.initial_robottt_state(batch_size)
+        if len(robottt_state.layers) != len(self.transformer_blocks):
+            raise ValueError(
+                "RoboTTT state layer count does not match DiT: "
+                f"{len(robottt_state.layers)} != {len(self.transformer_blocks)}"
+            )
+
+        flat_batch = batch_size * trajectory_length
+        vl_length, vl_dim = encoder_hidden_states.shape[2:]
+        flat_encoder = encoder_hidden_states.reshape(flat_batch, vl_length, vl_dim).contiguous()
+        flat_image_mask = image_mask.reshape(flat_batch, vl_length)
+        flat_backbone_mask = backbone_attention_mask.reshape(flat_batch, vl_length)
+        image_attention_mask = flat_image_mask & flat_backbone_mask
+        non_image_attention_mask = (~flat_image_mask) & flat_backbone_mask
+        temb = self.timestep_encoder(timestep.reshape(flat_batch))
+
+        all_hidden_states = [hidden_states]
+        next_layer_states = []
+        layer_losses = []
+        layer_updates = []
+        for idx, (block, layer_state) in enumerate(
+            zip(self.transformer_blocks, robottt_state.layers)
+        ):
+            if idx % 2 == 1:
+                current_encoder = None
+                current_mask = None
+            else:
+                current_encoder = flat_encoder
+                if idx % (2 * self.attend_text_every_n_blocks) == 0:
+                    current_mask = non_image_attention_mask
+                else:
+                    current_mask = image_attention_mask
+
+            hidden_states, next_layer_state, metrics = block.forward_sequence(
+                hidden_states,
+                robottt_state=layer_state,
+                temporal_positions=temporal_positions,
+                valid_mask=valid_mask,
+                update_mask=update_mask,
+                attention_mask=None,
+                encoder_hidden_states=current_encoder,
+                encoder_attention_mask=current_mask,
+                temb=temb,
+            )
+            next_layer_states.append(next_layer_state)
+            layer_losses.append(metrics["inner_loss"])
+            layer_updates.append(metrics["num_updates"])
+            all_hidden_states.append(hidden_states)
+
+        flat_hidden = hidden_states.reshape(flat_batch, num_tokens, dim)
+        shift, scale = self.proj_out_1(F.silu(temb)).chunk(2, dim=1)
+        flat_hidden = self.norm_out(flat_hidden) * (1 + scale[:, None]) + shift[:, None]
+        output = self.proj_out_2(flat_hidden).reshape(
+            batch_size, trajectory_length, num_tokens, self.config.output_dim
+        )
+        next_state = RoboTTTState(tuple(next_layer_states))
+        metrics = {
+            "inner_loss": torch.stack(layer_losses),
+            "num_updates": torch.stack(layer_updates),
+        }
+        if return_all_hidden_states:
+            return output, all_hidden_states, next_state, metrics
+        return output, next_state, metrics
+
     def forward(
         self,
         hidden_states: torch.Tensor,  # Shape: (B, T, D)
@@ -355,8 +555,28 @@ class AlternateVLDiT(DiT):
         return_all_hidden_states: bool = False,
         image_mask: Optional[torch.Tensor] = None,
         backbone_attention_mask: Optional[torch.Tensor] = None,
+        robottt_state: Optional[RoboTTTState] = None,
+        temporal_positions: Optional[torch.Tensor] = None,
+        valid_mask: Optional[torch.Tensor] = None,
+        update_mask: Optional[torch.Tensor] = None,
     ):
         assert image_mask is not None, "Image mask is required"
+
+        if self.config.robottt_enabled:
+            if temporal_positions is None or valid_mask is None or update_mask is None:
+                raise ValueError("RoboTTT requires temporal_positions, valid_mask, and update_mask")
+            return self._forward_robottt_sequence(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                timestep=timestep,
+                image_mask=image_mask,
+                backbone_attention_mask=backbone_attention_mask,
+                robottt_state=robottt_state,
+                temporal_positions=temporal_positions,
+                valid_mask=valid_mask,
+                update_mask=update_mask,
+                return_all_hidden_states=return_all_hidden_states,
+            )
 
         # Encode timesteps
         temb = self.timestep_encoder(timestep)
