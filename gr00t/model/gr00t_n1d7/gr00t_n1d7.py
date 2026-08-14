@@ -825,7 +825,23 @@ class Gr00tN1d7(PreTrainedModel):
         # Prepare inputs for backbone and action head
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         backbone_outputs = self.backbone(backbone_inputs)
-        action_outputs = self.action_head(backbone_outputs, action_inputs)
+        if self.config.robottt_enabled and "trajectory_shape" in action_inputs:
+            batch_size, trajectory_length = [
+                int(value) for value in action_inputs.trajectory_shape.tolist()
+            ]
+            flat_batch = batch_size * trajectory_length
+            for key, value in list(backbone_outputs.items()):
+                if isinstance(value, torch.Tensor) and value.shape[0] == flat_batch:
+                    backbone_outputs[key] = value.reshape(
+                        batch_size, trajectory_length, *value.shape[1:]
+                    )
+            action_outputs = self.action_head.forward_sequence(
+                backbone_outputs,
+                action_inputs,
+                tbptt_steps=getattr(self.config, "robottt_tbptt_steps", 128),
+            )
+        else:
+            action_outputs = self.action_head(backbone_outputs, action_inputs)
 
         return action_outputs
 

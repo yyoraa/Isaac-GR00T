@@ -19,6 +19,7 @@ from tqdm import tqdm
 from gr00t.configs.base_config import Config
 from gr00t.data.dataset.sharded_mixture_dataset import ShardedMixtureDataset
 from gr00t.data.dataset.sharded_single_step_dataset import ShardedSingleStepDataset
+from gr00t.data.dataset.trajectory_sequence_dataset import TrajectorySequenceDataset
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.interfaces import BaseProcessor
 from gr00t.data.stats import generate_rel_stats, generate_stats
@@ -58,15 +59,28 @@ class DatasetFactory:
                     if is_rank0:
                         generate_stats(dataset_path)
                         generate_rel_stats(dataset_path, EmbodimentTag(embodiment_tag))
-                dataset = ShardedSingleStepDataset(
-                    dataset_path=dataset_path,
-                    embodiment_tag=EmbodimentTag(embodiment_tag),
-                    modality_configs=self.config.data.modality_configs[embodiment_tag],
-                    shard_size=self.config.data.shard_size,
-                    episode_sampling_rate=self.config.data.episode_sampling_rate,
-                    seed=self.config.data.seed,
-                    allow_padding=self.config.data.allow_padding,
-                )
+                modality_configs = self.config.data.modality_configs[embodiment_tag]
+                if getattr(self.config.data, "sequence_mode", False) is True:
+                    action_horizon = len(modality_configs["action"].delta_indices)
+                    dataset = TrajectorySequenceDataset.from_lerobot(
+                        dataset_path=dataset_path,
+                        embodiment_tag=EmbodimentTag(embodiment_tag),
+                        modality_configs=modality_configs,
+                        context_length=self.config.data.context_length,
+                        stride=self.config.data.sequence_stride,
+                        action_horizon=action_horizon,
+                        allow_padding=self.config.data.allow_padding,
+                    )
+                else:
+                    dataset = ShardedSingleStepDataset(
+                        dataset_path=dataset_path,
+                        embodiment_tag=EmbodimentTag(embodiment_tag),
+                        modality_configs=modality_configs,
+                        shard_size=self.config.data.shard_size,
+                        episode_sampling_rate=self.config.data.episode_sampling_rate,
+                        seed=self.config.data.seed,
+                        allow_padding=self.config.data.allow_padding,
+                    )
                 datasets.append(dataset)
             dataset_lengths = np.array([len(dataset) for dataset in datasets])
             dataset_relative_lengths = dataset_lengths / dataset_lengths.sum()

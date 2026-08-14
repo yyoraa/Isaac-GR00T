@@ -93,6 +93,12 @@ class DataConfig:
     multiprocessing_context: str = "fork"  # Options: "fork", "spawn", and "forkserver"
     allow_padding: bool = False
 
+    # Episode-aligned RoboTTT windows.
+    sequence_mode: bool = False
+    context_length: int = 1024
+    sequence_stride: int = 1024
+    tbptt_steps: int = 128
+
     # Subsample ratio for the dataset
     subsample_ratio: float = 1.0
 

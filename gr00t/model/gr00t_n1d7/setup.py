@@ -24,6 +24,7 @@ from transformers import AutoModel, AutoProcessor
 from gr00t.configs.base_config import Config
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
 from gr00t.data.dataset.factory import DatasetFactory
+from gr00t.data.dataset.trajectory_sequence_dataset import TrajectoryCollator
 from gr00t.model.base.model_pipeline import ModelPipeline
 from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7
 from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor
@@ -236,6 +237,8 @@ class Gr00tN1d7Pipeline(ModelPipeline):
 
     def _create_collator(self):
         data_collator = self.processor.collator
+        if getattr(self.config.data, "sequence_mode", False) is True:
+            data_collator = TrajectoryCollator(data_collator)
         return data_collator
 
 
