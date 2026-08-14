@@ -30,6 +30,7 @@ from gr00t.model.modules.embodiment_conditioned_mlp import (
     CategorySpecificMLP,
     MultiEmbodimentActionEncoder,
 )
+from gr00t.model.modules.robottt import RoboTTTState
 
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,11 @@ class Gr00tN1d7ActionHead(nn.Module):
                 **config.diffusion_model_cfg,
                 cross_attention_dim=config.backbone_embedding_dim,
                 attend_text_every_n_blocks=config.attend_text_every_n_blocks,
+                robottt_enabled=config.robottt_enabled,
+                robottt_inner_dim=config.robottt_inner_dim,
+                robottt_inner_lr=config.robottt_inner_lr,
+                robottt_rope_theta=config.robottt_rope_theta,
+                robottt_gate_init=config.robottt_gate_init,
             )
             logger.info("Using AlternateVLDiT for diffusion model")
         else:
@@ -62,6 +68,14 @@ class Gr00tN1d7ActionHead(nn.Module):
         self.action_dim = config.max_action_dim
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
+
+        if config.robottt_enabled:
+            self.register_tokens = nn.Parameter(
+                torch.empty(config.robottt_num_register_tokens, self.input_embedding_dim)
+            )
+            nn.init.normal_(self.register_tokens, mean=0.0, std=0.02)
+        else:
+            self.register_parameter("register_tokens", None)
 
         self.state_encoder = CategorySpecificMLP(
             num_categories=config.max_num_embodiments,
@@ -171,6 +185,11 @@ class Gr00tN1d7ActionHead(nn.Module):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
         sample = (1 - sample) * self.config.noise_s
         return sample
+
+    def sample_sequence_time(self, batch_size, trajectory_length, device, dtype):
+        """Sample independent flow times for every robot timestep."""
+        sample = self.beta_dist.sample([batch_size, trajectory_length]).to(device, dtype=dtype)
+        return ((1 - sample) * self.config.noise_s)[:, :, None, None]
 
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
         backbone_features = backbone_output["backbone_features"]
@@ -284,6 +303,166 @@ class Gr00tN1d7ActionHead(nn.Module):
             "backbone_features": vl_embeds,
             "state_features": state_features,
         }
+
+    def forward_sequence(
+        self,
+        backbone_output: BatchFeature,
+        action_input: BatchFeature,
+        robottt_state: RoboTTTState | None = None,
+        tbptt_steps: int | None = None,
+    ) -> BatchFeature:
+        """Train RoboTTT on an episode-aligned sequence of robot timesteps."""
+        if not self.config.robottt_enabled:
+            raise RuntimeError("forward_sequence requires robottt_enabled=True")
+        self.set_frozen_modules_to_eval_mode()
+
+        vl_embeds = backbone_output.backbone_features
+        if vl_embeds.ndim != 4:
+            raise ValueError(
+                "sequence backbone_features must have shape [B,T,S,D], "
+                f"got {tuple(vl_embeds.shape)}"
+            )
+        batch_size, trajectory_length, vl_length, vl_dim = vl_embeds.shape
+        flat_batch = batch_size * trajectory_length
+        vl_embeds = self.vlln(vl_embeds.reshape(flat_batch, vl_length, vl_dim))
+        vl_embeds = self.vl_self_attention(vl_embeds)
+        vl_embeds = vl_embeds.reshape(batch_size, trajectory_length, vl_length, vl_dim)
+
+        embodiment_id = action_input.embodiment_id
+        expected_time_shape = (batch_size, trajectory_length)
+        if embodiment_id.shape != expected_time_shape:
+            raise ValueError(
+                f"embodiment_id must have shape {expected_time_shape}, "
+                f"got {tuple(embodiment_id.shape)}"
+            )
+        flat_embodiment = embodiment_id.reshape(flat_batch)
+
+        state = action_input.state
+        expected_state_shape = (
+            batch_size,
+            trajectory_length,
+            self.config.state_history_length,
+            self.config.max_state_dim,
+        )
+        if state.shape != expected_state_shape:
+            raise ValueError(
+                f"state must have shape {expected_state_shape}, got {tuple(state.shape)}"
+            )
+        flat_state = state.reshape(flat_batch, 1, -1)
+        state_features = self.state_encoder(flat_state, flat_embodiment).reshape(
+            batch_size, trajectory_length, 1, self.input_embedding_dim
+        )
+
+        if self.training and self.state_dropout_prob > 0:
+            keep = (
+                torch.rand(batch_size, trajectory_length, device=state.device)
+                >= self.state_dropout_prob
+            )
+            state_features = state_features * keep[:, :, None, None].to(state_features.dtype)
+
+        actions = action_input.action
+        expected_action_shape = (
+            batch_size,
+            trajectory_length,
+            self.action_horizon,
+            self.action_dim,
+        )
+        if actions.shape != expected_action_shape:
+            raise ValueError(
+                f"action must have shape {expected_action_shape}, got {tuple(actions.shape)}"
+            )
+        noise = torch.randn_like(actions)
+        flow_time = self.sample_sequence_time(
+            batch_size, trajectory_length, actions.device, actions.dtype
+        )
+        noisy_trajectory = (1 - flow_time) * noise + flow_time * actions
+        velocity = actions - noise
+        timestep = (flow_time[:, :, 0, 0] * self.num_timestep_buckets).long()
+        action_features = self.action_encoder(
+            noisy_trajectory.reshape(flat_batch, self.action_horizon, self.action_dim),
+            timestep.reshape(flat_batch),
+            flat_embodiment,
+        ).reshape(batch_size, trajectory_length, self.action_horizon, self.input_embedding_dim)
+
+        if self.config.add_pos_embed:
+            position_ids = torch.arange(self.action_horizon, device=actions.device)
+            action_features = action_features + self.position_embedding(position_ids).view(
+                1, 1, self.action_horizon, self.input_embedding_dim
+            )
+
+        registers = self.register_tokens.view(
+            1, 1, self.config.robottt_num_register_tokens, self.input_embedding_dim
+        ).expand(batch_size, trajectory_length, -1, -1)
+        sequence_tokens = torch.cat((registers, state_features, action_features), dim=2)
+        valid_mask = action_input.get(
+            "valid_mask", torch.ones(expected_time_shape, device=actions.device, dtype=torch.bool)
+        ).bool()
+        temporal_positions = action_input.get(
+            "temporal_positions",
+            torch.arange(trajectory_length, device=actions.device)
+            .view(1, -1)
+            .expand(batch_size, -1),
+        )
+
+        segment_length = trajectory_length if tbptt_steps is None else tbptt_steps
+        if segment_length <= 0:
+            raise ValueError(f"tbptt_steps must be positive, got {segment_length}")
+        segment_outputs = []
+        segment_losses = []
+        segment_updates = []
+        current_state = robottt_state
+        for start in range(0, trajectory_length, segment_length):
+            end = min(start + segment_length, trajectory_length)
+            segment_output, current_state, segment_metrics = self.model(
+                hidden_states=sequence_tokens[:, start:end],
+                encoder_hidden_states=vl_embeds[:, start:end],
+                timestep=timestep[:, start:end],
+                image_mask=backbone_output.image_mask[:, start:end],
+                backbone_attention_mask=backbone_output.backbone_attention_mask[:, start:end],
+                robottt_state=current_state,
+                temporal_positions=temporal_positions[:, start:end],
+                valid_mask=valid_mask[:, start:end],
+                update_mask=valid_mask[:, start:end],
+            )
+            segment_outputs.append(segment_output)
+            segment_losses.append(segment_metrics["inner_loss"])
+            segment_updates.append(segment_metrics["num_updates"])
+            if end < trajectory_length:
+                current_state = current_state.detach()
+
+        model_output = torch.cat(segment_outputs, dim=1)
+        next_state = current_state
+        robottt_metrics = {
+            "inner_loss": torch.stack(segment_losses).mean(dim=0),
+            "num_updates": torch.stack(segment_updates).sum(dim=0),
+        }
+        flat_output = model_output.reshape(flat_batch, model_output.shape[2], model_output.shape[3])
+        prediction = self.action_decoder(flat_output, flat_embodiment).reshape(
+            batch_size, trajectory_length, model_output.shape[2], self.action_dim
+        )
+        pred_actions = prediction[:, :, -self.action_horizon :]
+
+        action_mask = action_input.action_mask
+        action_loss_mask = action_input.get("action_loss_mask", valid_mask).bool()
+        effective_mask = (
+            action_mask
+            * valid_mask[:, :, None, None].to(action_mask.dtype)
+            * action_loss_mask[:, :, None, None].to(action_mask.dtype)
+        )
+        action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * effective_mask
+        loss = action_loss.sum() / effective_mask.sum().clamp_min(1)
+        return BatchFeature(
+            data={
+                "loss": loss,
+                "action_loss": action_loss,
+                "action_mask": effective_mask,
+                "pred_actions": pred_actions,
+                "backbone_features": vl_embeds,
+                "state_features": state_features,
+                "robottt_state": next_state,
+                "robottt_metrics": robottt_metrics,
+            }
+        )
 
     def _encode_features(
         self, backbone_output: BatchFeature, action_input: BatchFeature
