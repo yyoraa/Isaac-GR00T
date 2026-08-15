@@ -86,10 +86,14 @@ def test_alternate_vl_dit_builds_robottt_in_every_layer():
         cross_attention_dim=8,
         robottt_enabled=True,
         robottt_inner_dim=16,
+        robottt_analytic_inner_update=True,
+        robottt_compile_inner_update=True,
     )
 
     assert len(model.transformer_blocks) == 4
     assert all(block.robottt is not None for block in model.transformer_blocks)
+    assert all(block.robottt.analytic_inner_update for block in model.transformer_blocks)
+    assert all(block.robottt.compile_inner_update for block in model.transformer_blocks)
     state = model.initial_robottt_state(batch_size=2)
     assert len(state.layers) == 4
     assert all(layer_state.w1.shape == (2, 8, 16) for layer_state in state.layers)

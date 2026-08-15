@@ -19,6 +19,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch import nn
 from transformers import AutoModel, AutoProcessor
 
 from gr00t.configs.base_config import Config
@@ -43,6 +44,34 @@ def convert_tensors_to_lists(obj):
         return [convert_tensors_to_lists(item) for item in obj]
     else:
         return obj
+
+
+def _initialize_missing_robottt_parameters(
+    model, missing_keys: list[str], *, dtype: torch.dtype
+) -> set[str]:
+    """Initialize complete RoboTTT modules omitted by a non-RoboTTT checkpoint."""
+    missing = set(missing_keys)
+    initialized: set[str] = set()
+    register_key = "action_head.register_tokens"
+    if register_key in missing and model.action_head.register_tokens is not None:
+        model.action_head.register_tokens.data = model.action_head.register_tokens.data.to(dtype)
+        nn.init.normal_(model.action_head.register_tokens, mean=0.0, std=0.02)
+        initialized.add(register_key)
+
+    blocks = getattr(getattr(model.action_head, "model", None), "transformer_blocks", ())
+    for index, block in enumerate(blocks):
+        robottt = getattr(block, "robottt", None)
+        if robottt is None:
+            continue
+        prefix = f"action_head.model.transformer_blocks.{index}.robottt."
+        layer_keys = {prefix + name for name, _ in robottt.named_parameters()}
+        missing_layer_keys = missing & layer_keys
+        if missing_layer_keys == layer_keys:
+            robottt.to(dtype=dtype)
+            robottt.reset_parameters()
+            initialized.update(layer_keys)
+
+    return initialized
 
 
 class Gr00tN1d7Pipeline(ModelPipeline):
@@ -97,6 +126,11 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 robottt_rope_theta=self.config.model.robottt_rope_theta,
                 robottt_gate_init=self.config.model.robottt_gate_init,
                 robottt_tbptt_steps=self.config.model.robottt_tbptt_steps,
+                robottt_backbone_micro_batch_size=(
+                    self.config.model.robottt_backbone_micro_batch_size
+                ),
+                robottt_analytic_inner_update=self.config.model.robottt_analytic_inner_update,
+                robottt_compile_inner_update=self.config.model.robottt_compile_inner_update,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
                 output_loading_info=True,
                 **self.transformers_loading_kwargs,
@@ -113,18 +147,20 @@ class Gr00tN1d7Pipeline(ModelPipeline):
 
             unexpected_keys = loading_info.get("unexpected_keys", [])
             mismatched_keys = loading_info.get("mismatched_keys", [])
-            expected_robottt_missing = [
-                key for key in missing_keys if key.endswith("register_tokens") or ".robottt." in key
-            ]
-            if expected_robottt_missing:
+            initialized_robottt_missing = _initialize_missing_robottt_parameters(
+                model,
+                missing_keys,
+                dtype=torch.bfloat16 if self.config.model.load_bf16 else torch.float32,
+            )
+            if initialized_robottt_missing:
                 logging.info(
                     "Initialized %d new RoboTTT/register parameters not present in the base checkpoint",
-                    len(expected_robottt_missing),
+                    len(initialized_robottt_missing),
                 )
             other_missing = [
                 key
                 for key in missing_keys
-                if "mask_token" not in key and key not in expected_robottt_missing
+                if "mask_token" not in key and key not in initialized_robottt_missing
             ]
             errors = []
             if other_missing:

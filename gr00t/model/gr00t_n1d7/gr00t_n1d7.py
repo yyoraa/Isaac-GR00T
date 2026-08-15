@@ -57,6 +57,8 @@ class Gr00tN1d7ActionHead(nn.Module):
                 robottt_inner_lr=config.robottt_inner_lr,
                 robottt_rope_theta=config.robottt_rope_theta,
                 robottt_gate_init=config.robottt_gate_init,
+                robottt_analytic_inner_update=config.robottt_analytic_inner_update,
+                robottt_compile_inner_update=config.robottt_compile_inner_update,
             )
             logger.info("Using AlternateVLDiT for diffusion model")
         else:

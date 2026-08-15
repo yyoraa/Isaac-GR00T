@@ -34,6 +34,7 @@ class RoboTTTLaunchConfig:
     use_wandb: bool = False
     dataloader_num_workers: int = 0
     tbptt_steps: int = 1
+    backbone_micro_batch_size: int = 8
 
 
 def _manifest_sha256(path: str | Path) -> str:
@@ -81,7 +82,14 @@ def build_robottt_config(launch: RoboTTTLaunchConfig) -> Config:
     config.model.robottt_gate_init = 0.001
     if launch.tbptt_steps <= 0:
         raise ValueError("tbptt_steps must be positive")
+    if launch.backbone_micro_batch_size <= 0:
+        raise ValueError("backbone_micro_batch_size must be positive")
     config.model.robottt_tbptt_steps = launch.tbptt_steps
+    config.model.robottt_backbone_micro_batch_size = (
+        launch.backbone_micro_batch_size if launch.stage == "stage1" else None
+    )
+    config.model.robottt_analytic_inner_update = True
+    config.model.robottt_compile_inner_update = True
     config.model.model_name = "nvidia/Cosmos-Reason2-2B"
     config.model.load_bf16 = launch.stage == "stage1"
     config.model.backbone_trainable_params_fp32 = launch.stage == "stage2"

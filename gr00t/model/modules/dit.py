@@ -124,6 +124,8 @@ class BasicTransformerBlock(nn.Module):
         robottt_inner_lr: float = 0.1,
         robottt_rope_theta: float = 10000.0,
         robottt_gate_init: float = 0.001,
+        robottt_analytic_inner_update: bool = False,
+        robottt_compile_inner_update: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -190,6 +192,8 @@ class BasicTransformerBlock(nn.Module):
                 inner_lr=robottt_inner_lr,
                 rope_theta=robottt_rope_theta,
                 gate_init=robottt_gate_init,
+                analytic_inner_update=robottt_analytic_inner_update,
+                compile_inner_update=robottt_compile_inner_update,
             )
             if robottt_inner_dim is not None
             else None
@@ -328,6 +332,8 @@ class DiT(ModelMixin, ConfigMixin):
         robottt_inner_lr: float = 0.1,
         robottt_rope_theta: float = 10000.0,
         robottt_gate_init: float = 0.001,
+        robottt_analytic_inner_update: bool = False,
+        robottt_compile_inner_update: bool = False,
     ):
         super().__init__()
 
@@ -365,6 +371,8 @@ class DiT(ModelMixin, ConfigMixin):
                     robottt_inner_lr=robottt_inner_lr,
                     robottt_rope_theta=robottt_rope_theta,
                     robottt_gate_init=robottt_gate_init,
+                    robottt_analytic_inner_update=robottt_analytic_inner_update,
+                    robottt_compile_inner_update=robottt_compile_inner_update,
                 )
             ]
         self.transformer_blocks = nn.ModuleList(all_blocks)

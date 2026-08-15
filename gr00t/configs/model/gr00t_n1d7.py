@@ -118,6 +118,9 @@ class Gr00tN1d7Config(PretrainedConfig):
     robottt_rope_theta: float = 10000.0
     robottt_gate_init: float = 0.001
     robottt_tbptt_steps: int = 128
+    robottt_backbone_micro_batch_size: int | None = None
+    robottt_analytic_inner_update: bool = False
+    robottt_compile_inner_update: bool = False
 
     # Training parameters
     tune_projector: bool = True

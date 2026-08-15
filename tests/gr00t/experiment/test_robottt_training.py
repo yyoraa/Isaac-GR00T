@@ -14,8 +14,10 @@ from gr00t.experiment.robottt_trainer import (
     RoboTTTCurriculum,
     RoboTTTTrainer,
 )
+from gr00t.experiment.trainer import Gr00tTrainer
 import torch
 from torch import nn
+from transformers.feature_extraction_utils import BatchFeature
 
 
 class _TinyModel(nn.Module):
@@ -29,6 +31,23 @@ class _TinyModel(nn.Module):
         self.action_head.model = nn.Module()
         self.action_head.model.transformer_blocks = nn.ModuleList([block])
         self.action_head.action_decoder = nn.Linear(2, 2)
+
+
+class _RecordingCollator:
+    context_length = None
+
+    def set_context_length(self, context_length):
+        self.context_length = context_length
+
+
+class _BatchFeatureModel(nn.Module):
+    def forward(self, **inputs):
+        return BatchFeature(
+            data={
+                "loss": torch.tensor(2.5, requires_grad=True),
+                "robottt_state": "next-state",
+            }
+        )
 
 
 def test_stage_presets_match_public_robottt_schedule():
@@ -118,6 +137,39 @@ def test_curriculum_and_checkpoint_state_round_trip(tmp_path):
     restored.validate(stage="stage1", manifest_sha256="a" * 64)
 
 
+def test_fresh_training_applies_first_curriculum_bucket_before_parent_train(monkeypatch):
+    trainer = object.__new__(RoboTTTTrainer)
+    trainer.robottt_curriculum = RoboTTTCurriculum((128, 512), 10)
+    trainer.data_collator = _RecordingCollator()
+
+    monkeypatch.setattr(
+        Gr00tTrainer,
+        "train",
+        lambda self, **kwargs: self.data_collator.context_length,
+    )
+
+    assert trainer.train() == 128
+
+
+def test_robottt_compute_loss_accepts_batch_feature_outputs(monkeypatch):
+    trainer = object.__new__(RoboTTTTrainer)
+
+    def reject_parent(*args, **kwargs):
+        raise AssertionError("RoboTTT sequence loss must not use the mapping-only parent path")
+
+    monkeypatch.setattr(Gr00tTrainer, "compute_loss", reject_parent)
+
+    loss, outputs = trainer.compute_loss(
+        _BatchFeatureModel(),
+        {"inputs": {"trajectory_shape": torch.tensor([1, 1])}},
+        return_outputs=True,
+    )
+
+    assert loss.item() == 2.5
+    assert outputs.robottt_state == "next-state"
+    assert trainer.loss is loss
+
+
 def test_resume_state_rejects_stage_or_manifest_mismatch(tmp_path):
     state = RoboTTTCheckpointState(
         stage="stage1",
@@ -182,6 +234,27 @@ def test_launcher_loads_frozen_stage1_base_in_bf16(tmp_path):
 
     assert config.model.load_bf16 is True
     assert config.model.backbone_trainable_params_fp32 is False
+    assert config.model.robottt_backbone_micro_batch_size == 8
+    assert config.model.robottt_analytic_inner_update is True
+    assert config.model.robottt_compile_inner_update is True
+
+
+def test_stage2_disables_frozen_backbone_cache_but_keeps_compiled_inner_update(tmp_path):
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text('{"episode_id": "ep-1"}\n')
+
+    config = build_robottt_config(
+        RoboTTTLaunchConfig(
+            stage="stage2",
+            base_model_path="stage1-checkpoint",
+            dataset_path="robocasa365-lerobot",
+            manifest_path=str(manifest),
+        )
+    )
+
+    assert config.model.robottt_backbone_micro_batch_size is None
+    assert config.model.robottt_analytic_inner_update is True
+    assert config.model.robottt_compile_inner_update is True
 
 
 def test_trajectory_sampler_state_restores_exact_next_shard():
