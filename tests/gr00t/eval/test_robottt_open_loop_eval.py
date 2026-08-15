@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from gr00t.eval.open_loop_eval import (
     ArgsConfig,
     configure_robottt_evaluation_mode,
+    get_robottt_observation_count,
     reset_policy_for_trajectory,
     write_evaluation_json,
 )
@@ -13,6 +14,7 @@ import pytest
 class _StatefulActionHead:
     def __init__(self):
         self.online_updates = None
+        self.robottt_observation_count = 0
 
     def set_robottt_online_updates(self, enabled):
         self.online_updates = enabled
@@ -50,6 +52,13 @@ def test_every_trajectory_reset_starts_from_initial_state():
         assert policy.state == 0
 
     assert policy.reset_count == 2
+
+
+def test_robottt_observation_count_is_available_for_result_auditing():
+    policy = _StatefulPolicy()
+    policy.model.action_head.robottt_observation_count = 3
+
+    assert get_robottt_observation_count(policy) == 3
 
 
 def test_write_evaluation_json_preserves_literal_metrics(tmp_path):

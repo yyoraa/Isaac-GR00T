@@ -152,6 +152,13 @@ def reset_policy_for_trajectory(policy: BasePolicy) -> None:
     policy.reset()
 
 
+def get_robottt_observation_count(policy: BasePolicy) -> int | None:
+    """Return the fast-state update count when the local policy exposes it."""
+    action_head = getattr(getattr(policy, "model", None), "action_head", None)
+    count = getattr(action_head, "robottt_observation_count", None)
+    return int(count) if count is not None else None
+
+
 def write_evaluation_json(
     path: str | Path,
     config: "ArgsConfig",
@@ -421,9 +428,11 @@ def main(args: ArgsConfig):
         logging.info(f"MSE for trajectory {traj_id}: {mse}, MAE: {mae}")
         all_mse.append(mse)
         all_mae.append(mae)
-        per_trajectory.append(
-            {"trajectory_id": traj_id, "mse": float(mse), "mae": float(mae)}
-        )
+        record = {"trajectory_id": traj_id, "mse": float(mse), "mae": float(mae)}
+        observation_count = get_robottt_observation_count(policy)
+        if observation_count is not None:
+            record["robottt_observation_count"] = observation_count
+        per_trajectory.append(record)
 
     if all_mse:
         avg_mse = np.mean(np.array(all_mse))
