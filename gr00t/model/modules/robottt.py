@@ -13,6 +13,70 @@ from torch import nn
 import torch.nn.functional as F
 
 
+def _gelu_exact_derivative(value: torch.Tensor) -> torch.Tensor:
+    """Derivative of ``torch.nn.functional.gelu`` with ``approximate='none'``."""
+    normal_cdf = 0.5 * (1.0 + torch.erf(value / math.sqrt(2.0)))
+    normal_pdf = torch.exp(-0.5 * value.square()) / math.sqrt(2.0 * math.pi)
+    return normal_cdf + value * normal_pdf
+
+
+def _analytic_fast_mlp_step(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    w1: torch.Tensor,
+    b1: torch.Tensor,
+    w2: torch.Tensor,
+    b2: torch.Tensor,
+    update_mask: torch.Tensor,
+    step_size: torch.Tensor,
+    *,
+    create_graph: bool,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], torch.Tensor]:
+    """Apply one exact analytic gradient step to the per-example fast MLP."""
+    pre_activation = torch.einsum("bnd,bdh->bnh", key, w1) + b1[:, None]
+    hidden = F.gelu(pre_activation)
+    prediction = torch.einsum("bnh,bhd->bnd", hidden, w2) + b2[:, None]
+    residual = prediction - value
+    per_example_loss = residual.square().mean(dim=(1, 2))
+
+    scale = 2.0 / (prediction.shape[1] * prediction.shape[2])
+    grad_prediction = (
+        residual * scale * update_mask.to(residual.dtype).reshape(-1, 1, 1)
+    )
+    grad_w2 = torch.einsum("bnh,bnd->bhd", hidden, grad_prediction)
+    grad_b2 = grad_prediction.sum(dim=1)
+    grad_hidden = torch.einsum("bnd,bhd->bnh", grad_prediction, w2)
+    grad_pre_activation = grad_hidden * _gelu_exact_derivative(pre_activation)
+    grad_w1 = torch.einsum("bnd,bnh->bdh", key, grad_pre_activation)
+    grad_b1 = grad_pre_activation.sum(dim=1)
+    gradients = (grad_w1, grad_b1, grad_w2, grad_b2)
+    if not create_graph:
+        gradients = tuple(gradient.detach() for gradient in gradients)
+
+    previous = (w1, b1, w2, b2)
+    candidates = tuple(
+        parameter - step_size * gradient
+        for parameter, gradient in zip(previous, gradients)
+    )
+    updated = []
+    for candidate, old_value in zip(candidates, previous):
+        broadcast_mask = update_mask.reshape(
+            update_mask.shape[0], *([1] * (candidate.ndim - 1))
+        )
+        updated.append(torch.where(broadcast_mask, candidate, old_value))
+
+    updated_w1, updated_b1, updated_w2, updated_b2 = updated
+    adapted_hidden = F.gelu(
+        torch.einsum("bnd,bdh->bnh", query, updated_w1) + updated_b1[:, None]
+    )
+    adapted = (
+        torch.einsum("bnh,bhd->bnd", adapted_hidden, updated_w2)
+        + updated_b2[:, None]
+    )
+    return adapted, tuple(updated), per_example_loss
+
+
 def apply_temporal_rope(
     tokens: torch.Tensor, positions: torch.Tensor, theta: float = 10000.0
 ) -> torch.Tensor:
@@ -87,6 +151,7 @@ class RoboTTTLayer(nn.Module):
         inner_lr: float = 0.1,
         rope_theta: float = 10000.0,
         gate_init: float = 0.001,
+        analytic_inner_update: bool = False,
     ):
         super().__init__()
         if dim <= 0:
@@ -102,17 +167,30 @@ class RoboTTTLayer(nn.Module):
         self.inner_dim = inner_dim
         self.inner_lr = inner_lr
         self.rope_theta = rope_theta
+        self.gate_init = gate_init
+        self.analytic_inner_update = analytic_inner_update
         self.w0_w1 = nn.Parameter(torch.empty(dim, inner_dim))
         self.w0_b1 = nn.Parameter(torch.zeros(inner_dim))
         self.w0_w2 = nn.Parameter(torch.empty(inner_dim, dim))
         self.w0_b2 = nn.Parameter(torch.zeros(dim))
-        nn.init.xavier_uniform_(self.w0_w1)
-        nn.init.xavier_uniform_(self.w0_w2)
         self.q_proj = nn.Linear(dim, dim, bias=False)
         self.k_proj = nn.Linear(dim, dim, bias=False)
         self.v_proj = nn.Linear(dim, dim, bias=False)
         self.inner_lr_log_multiplier = nn.Parameter(torch.tensor(math.log(math.expm1(1.0))))
         self.gate = nn.Parameter(torch.full((dim,), math.atanh(gate_init)))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Restore the learned initial state after meta-device checkpoint loading."""
+        nn.init.xavier_uniform_(self.w0_w1)
+        nn.init.zeros_(self.w0_b1)
+        nn.init.xavier_uniform_(self.w0_w2)
+        nn.init.zeros_(self.w0_b2)
+        self.q_proj.reset_parameters()
+        self.k_proj.reset_parameters()
+        self.v_proj.reset_parameters()
+        nn.init.constant_(self.inner_lr_log_multiplier, math.log(math.expm1(1.0)))
+        nn.init.constant_(self.gate, math.atanh(self.gate_init))
 
     def initial_state(self, batch_size: int) -> FastMLPState:
         """Expand learned W0 into independent fast weights for each example."""
@@ -166,36 +244,50 @@ class RoboTTTLayer(nn.Module):
             )
         update_mask = update_mask.to(device=tokens.device, dtype=torch.bool)
 
-        query = apply_temporal_rope(self.q_proj(tokens), positions, self.rope_theta)
-        key = apply_temporal_rope(self.k_proj(tokens), positions, self.rope_theta)
-        value = self.v_proj(tokens)
+        normalized_tokens = F.layer_norm(tokens, (self.dim,))
+        query = apply_temporal_rope(self.q_proj(normalized_tokens), positions, self.rope_theta)
+        key = apply_temporal_rope(self.k_proj(normalized_tokens), positions, self.rope_theta)
+        value = self.v_proj(normalized_tokens)
 
         with torch.enable_grad():
-            prediction = self._fast_forward(key, state)
-            per_example_loss = (prediction - value).square().mean(dim=(1, 2))
+            if self.analytic_inner_update:
+                step_size = self.inner_lr * F.softplus(self.inner_lr_log_multiplier)
+                adapted, updated_tensors, per_example_loss = _analytic_fast_mlp_step(
+                    query,
+                    key,
+                    value,
+                    *state.tensors(),
+                    update_mask,
+                    step_size,
+                    create_graph=self.training,
+                )
+                updated = FastMLPState(*updated_tensors)
+            else:
+                prediction = self._fast_forward(key, state)
+                per_example_loss = (prediction - value).square().mean(dim=(1, 2))
+                if update_mask.any():
+                    objective = (per_example_loss * update_mask).sum()
+                    gradients = torch.autograd.grad(
+                        objective,
+                        state.tensors(),
+                        create_graph=self.training,
+                        allow_unused=False,
+                    )
+                    step_size = self.inner_lr * F.softplus(self.inner_lr_log_multiplier)
+                    candidate = FastMLPState(
+                        *(
+                            parameter - step_size * gradient
+                            for parameter, gradient in zip(state.tensors(), gradients)
+                        )
+                    )
+                    updated = self._blend_state(candidate, state, update_mask)
+                else:
+                    updated = state
+
+                adapted = self._fast_forward(query, updated)
+
             if not torch.isfinite(per_example_loss).all():
                 raise FloatingPointError("RoboTTT inner loss contains NaN or Inf")
-
-            if update_mask.any():
-                objective = (per_example_loss * update_mask).sum()
-                gradients = torch.autograd.grad(
-                    objective,
-                    state.tensors(),
-                    create_graph=self.training,
-                    allow_unused=False,
-                )
-                step_size = self.inner_lr * F.softplus(self.inner_lr_log_multiplier)
-                candidate = FastMLPState(
-                    *(
-                        parameter - step_size * gradient
-                        for parameter, gradient in zip(state.tensors(), gradients)
-                    )
-                )
-                updated = self._blend_state(candidate, state, update_mask)
-            else:
-                updated = state
-
-            adapted = self._fast_forward(query, updated)
 
         output = tokens + torch.tanh(self.gate).view(1, 1, -1) * adapted
         active_count = update_mask.sum()

@@ -99,11 +99,32 @@ def test_step_updates_before_applying_fast_model():
         update_mask=torch.tensor([True]),
     )
 
-    post_update_value = _manual_fast_forward(tokens, updated)
-    pre_update_value = _manual_fast_forward(tokens, initial)
+    normalized = torch.nn.functional.layer_norm(tokens, (2,))
+    post_update_value = _manual_fast_forward(normalized, updated)
+    pre_update_value = _manual_fast_forward(normalized, initial)
     expected = tokens + 0.5 * post_update_value
     torch.testing.assert_close(output, expected)
     assert not torch.allclose(output, tokens + 0.5 * pre_update_value)
+
+
+def test_inner_update_normalizes_large_backbone_residuals():
+    torch.manual_seed(0)
+    layer = RoboTTTLayer(dim=8, inner_dim=16, inner_lr=0.1)
+    state = layer.initial_state(batch_size=1)
+
+    for position in range(2):
+        tokens = torch.randn(1, 4, 8) * 1_000
+        output, state, metrics = layer.step(
+            tokens,
+            state,
+            positions=torch.tensor([position]),
+            update_mask=torch.tensor([True]),
+        )
+
+        assert torch.isfinite(output).all()
+        assert torch.isfinite(metrics["inner_loss"])
+        assert all(torch.isfinite(value).all() for value in state.tensors())
+        assert max(value.detach().abs().max() for value in state.tensors()) < 10
 
 
 def test_outer_loss_reaches_w0_qkv_gate_and_learning_rate():
@@ -128,6 +149,91 @@ def test_outer_loss_reaches_w0_qkv_gate_and_learning_rate():
     ]
     assert all(parameter.grad is not None for parameter in parameters)
     assert all(torch.isfinite(parameter.grad).all() for parameter in parameters)
+
+
+def _run_step_and_backward(layer, tokens, positions, update_mask):
+    output, state, metrics = layer.step(
+        tokens,
+        layer.initial_state(tokens.shape[0]),
+        positions=positions,
+        update_mask=update_mask,
+    )
+    (output.square().mean() + metrics["inner_loss"]).backward()
+    gradients = {
+        name: parameter.grad.detach().clone()
+        for name, parameter in layer.named_parameters()
+        if parameter.grad is not None
+    }
+    return output, state, metrics, gradients
+
+
+def test_analytic_inner_update_matches_autograd_reference():
+    torch.manual_seed(19)
+    reference = RoboTTTLayer(dim=4, inner_dim=7, gate_init=0.2).double().train()
+    analytic = RoboTTTLayer(
+        dim=4,
+        inner_dim=7,
+        gate_init=0.2,
+        analytic_inner_update=True,
+    ).double().train()
+    analytic.load_state_dict(reference.state_dict())
+    tokens = torch.randn(2, 3, 4, dtype=torch.float64)
+    positions = torch.tensor([2, 5])
+    mask = torch.tensor([True, False])
+
+    reference_result = reference.step(tokens, reference.initial_state(2), positions, mask)
+    analytic_result = analytic.step(tokens, analytic.initial_state(2), positions, mask)
+
+    torch.testing.assert_close(analytic_result[0], reference_result[0], rtol=1e-10, atol=1e-10)
+    for actual, expected in zip(analytic_result[1].tensors(), reference_result[1].tensors()):
+        torch.testing.assert_close(actual, expected, rtol=1e-10, atol=1e-10)
+    torch.testing.assert_close(
+        analytic_result[2]["inner_loss"],
+        reference_result[2]["inner_loss"],
+        rtol=1e-10,
+        atol=1e-10,
+    )
+    assert analytic_result[2]["num_updates"].item() == 1
+
+
+def test_analytic_outer_gradients_match_autograd_reference():
+    torch.manual_seed(29)
+    reference = RoboTTTLayer(dim=4, inner_dim=7, gate_init=0.2).double().train()
+    analytic = RoboTTTLayer(
+        dim=4,
+        inner_dim=7,
+        gate_init=0.2,
+        analytic_inner_update=True,
+    ).double().train()
+    analytic.load_state_dict(reference.state_dict())
+    tokens = torch.randn(2, 3, 4, dtype=torch.float64)
+    positions = torch.tensor([2, 5])
+    mask = torch.tensor([True, False])
+
+    reference_result = _run_step_and_backward(reference, tokens, positions, mask)
+    analytic_result = _run_step_and_backward(analytic, tokens, positions, mask)
+
+    assert analytic_result[3].keys() == reference_result[3].keys()
+    for name in reference_result[3]:
+        torch.testing.assert_close(
+            analytic_result[3][name], reference_result[3][name], rtol=1e-9, atol=1e-10
+        )
+
+
+def test_analytic_all_masked_step_preserves_state_bitwise():
+    layer = RoboTTTLayer(dim=4, inner_dim=7, analytic_inner_update=True).double().train()
+    state = layer.initial_state(2)
+    tokens = torch.randn(2, 3, 4, dtype=torch.float64)
+
+    _, updated, metrics = layer.step(
+        tokens,
+        state,
+        positions=torch.tensor([0, 1]),
+        update_mask=torch.tensor([False, False]),
+    )
+
+    assert all(torch.equal(actual, expected) for actual, expected in zip(updated.tensors(), state.tensors()))
+    assert metrics["num_updates"].item() == 0
 
 
 def test_scan_does_not_apply_or_update_on_padding():
