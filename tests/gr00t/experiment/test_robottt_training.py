@@ -263,6 +263,7 @@ def test_stage1_launcher_uses_wsd_and_honors_quick_overrides(tmp_path):
     assert config.training.robottt_wsd_decay_steps == 10
     assert config.data.context_length == 128
     assert config.data.sequence_stride == 128
+    assert config.training.robottt_curriculum_buckets == [128]
 
 
 def test_one_step_smoke_has_a_valid_wsd_schedule(tmp_path):

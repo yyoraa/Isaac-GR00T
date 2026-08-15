@@ -136,9 +136,12 @@ def build_robottt_config(launch: RoboTTTLaunchConfig) -> Config:
     config.training.use_ddp = launch.stage == "stage1" and launch.num_gpus > 1
     config.training.robottt_stage = launch.stage
     config.training.robottt_manifest_hash = _manifest_sha256(launch.manifest_path)
-    config.training.robottt_curriculum_buckets = (
-        [128, 512, 1024, 2048, 4096, 8192] if launch.stage == "stage1" else [1024]
-    )
+    if launch.context_length is not None:
+        config.training.robottt_curriculum_buckets = [launch.context_length]
+    else:
+        config.training.robottt_curriculum_buckets = (
+            [128, 512, 1024, 2048, 4096, 8192] if launch.stage == "stage1" else [1024]
+        )
     config.training.deepspeed_config_path = (
         preset.deepspeed_config if launch.stage == "stage2" else None
     )
