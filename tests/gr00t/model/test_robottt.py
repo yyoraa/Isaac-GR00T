@@ -2,6 +2,7 @@ import math
 
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
 from gr00t.model.modules.robottt import FastMLPState, RoboTTTLayer, apply_temporal_rope
+import pytest
 import torch
 
 
@@ -234,6 +235,40 @@ def test_analytic_all_masked_step_preserves_state_bitwise():
 
     assert all(torch.equal(actual, expected) for actual, expected in zip(updated.tensors(), state.tensors()))
     assert metrics["num_updates"].item() == 0
+
+
+def test_compile_inner_update_requires_analytic_backend():
+    with pytest.raises(ValueError, match="requires analytic_inner_update"):
+        RoboTTTLayer(dim=4, inner_dim=8, compile_inner_update=True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for compile parity")
+def test_compiled_inner_update_matches_eager_analytic_backend():
+    torch.manual_seed(37)
+    eager = RoboTTTLayer(dim=4, inner_dim=7, analytic_inner_update=True).cuda().train()
+    compiled = RoboTTTLayer(
+        dim=4,
+        inner_dim=7,
+        analytic_inner_update=True,
+        compile_inner_update=True,
+    ).cuda().train()
+    compiled.load_state_dict(eager.state_dict())
+    tokens = torch.randn(2, 3, 4, device="cuda")
+    positions = torch.tensor([1, 4], device="cuda")
+    mask = torch.tensor([True, False], device="cuda")
+
+    eager_result = _run_step_and_backward(eager, tokens, positions, mask)
+    compiled_result = _run_step_and_backward(compiled, tokens, positions, mask)
+    torch.cuda.synchronize()
+
+    assert compiled.inner_update_backend == "compiled"
+    torch.testing.assert_close(compiled_result[0], eager_result[0], rtol=2e-5, atol=2e-6)
+    for actual, expected in zip(compiled_result[1].tensors(), eager_result[1].tensors()):
+        torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
+    for name in eager_result[3]:
+        torch.testing.assert_close(
+            compiled_result[3][name], eager_result[3][name], rtol=3e-5, atol=3e-6
+        )
 
 
 def test_scan_does_not_apply_or_update_on_padding():

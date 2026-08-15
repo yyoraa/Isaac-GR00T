@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import warnings
 
 import torch
 from torch import nn
@@ -75,6 +76,13 @@ def _analytic_fast_mlp_step(
         + updated_b2[:, None]
     )
     return adapted, tuple(updated), per_example_loss
+
+
+_compiled_analytic_fast_mlp_step = torch.compile(
+    _analytic_fast_mlp_step,
+    fullgraph=True,
+    dynamic=False,
+)
 
 
 def apply_temporal_rope(
@@ -152,6 +160,7 @@ class RoboTTTLayer(nn.Module):
         rope_theta: float = 10000.0,
         gate_init: float = 0.001,
         analytic_inner_update: bool = False,
+        compile_inner_update: bool = False,
     ):
         super().__init__()
         if dim <= 0:
@@ -162,6 +171,8 @@ class RoboTTTLayer(nn.Module):
             raise ValueError(f"inner_lr must be positive, got {inner_lr}")
         if not -1.0 < gate_init < 1.0:
             raise ValueError(f"gate_init must be between -1 and 1, got {gate_init}")
+        if compile_inner_update and not analytic_inner_update:
+            raise ValueError("compile_inner_update requires analytic_inner_update=True")
 
         self.dim = dim
         self.inner_dim = inner_dim
@@ -169,6 +180,8 @@ class RoboTTTLayer(nn.Module):
         self.rope_theta = rope_theta
         self.gate_init = gate_init
         self.analytic_inner_update = analytic_inner_update
+        self.compile_inner_update = compile_inner_update
+        self._compile_failed = False
         self.w0_w1 = nn.Parameter(torch.empty(dim, inner_dim))
         self.w0_b1 = nn.Parameter(torch.zeros(inner_dim))
         self.w0_w2 = nn.Parameter(torch.empty(inner_dim, dim))
@@ -191,6 +204,16 @@ class RoboTTTLayer(nn.Module):
         self.v_proj.reset_parameters()
         nn.init.constant_(self.inner_lr_log_multiplier, math.log(math.expm1(1.0)))
         nn.init.constant_(self.gate, math.atanh(self.gate_init))
+
+    @property
+    def inner_update_backend(self) -> str:
+        if not self.analytic_inner_update:
+            return "autograd"
+        if self.compile_inner_update and not self._compile_failed:
+            return "compiled"
+        if self.compile_inner_update:
+            return "analytic-fallback"
+        return "analytic"
 
     def initial_state(self, batch_size: int) -> FastMLPState:
         """Expand learned W0 into independent fast weights for each example."""
@@ -252,15 +275,39 @@ class RoboTTTLayer(nn.Module):
         with torch.enable_grad():
             if self.analytic_inner_update:
                 step_size = self.inner_lr * F.softplus(self.inner_lr_log_multiplier)
-                adapted, updated_tensors, per_example_loss = _analytic_fast_mlp_step(
+                arguments = (
                     query,
                     key,
                     value,
                     *state.tensors(),
                     update_mask,
                     step_size,
-                    create_graph=self.training,
                 )
+                if self.compile_inner_update and not self._compile_failed:
+                    try:
+                        adapted, updated_tensors, per_example_loss = (
+                            _compiled_analytic_fast_mlp_step(
+                                *arguments,
+                                create_graph=self.training,
+                            )
+                        )
+                    except Exception as error:
+                        self._compile_failed = True
+                        warnings.warn(
+                            "RoboTTT compiled inner update failed; using eager analytic "
+                            f"fallback: {error}",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                        adapted, updated_tensors, per_example_loss = _analytic_fast_mlp_step(
+                            *arguments,
+                            create_graph=self.training,
+                        )
+                else:
+                    adapted, updated_tensors, per_example_loss = _analytic_fast_mlp_step(
+                        *arguments,
+                        create_graph=self.training,
+                    )
                 updated = FastMLPState(*updated_tensors)
             else:
                 prediction = self._fast_forward(key, state)
@@ -286,7 +333,10 @@ class RoboTTTLayer(nn.Module):
 
                 adapted = self._fast_forward(query, updated)
 
-            if not torch.isfinite(per_example_loss).all():
+            finite_inner_loss = torch.isfinite(per_example_loss).all()
+            if self.inner_update_backend == "compiled" and hasattr(torch, "_assert_async"):
+                torch._assert_async(finite_inner_loss, "RoboTTT inner loss contains NaN or Inf")
+            elif not finite_inner_loss:
                 raise FloatingPointError("RoboTTT inner loss contains NaN or Inf")
 
         output = tokens + torch.tanh(self.gate).view(1, 1, -1) * adapted
