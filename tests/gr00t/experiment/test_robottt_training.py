@@ -21,6 +21,7 @@ import pytest
 import torch
 from torch import nn
 from transformers.feature_extraction_utils import BatchFeature
+from transformers.trainer_utils import SchedulerType
 
 
 class _TinyModel(nn.Module):
@@ -60,7 +61,7 @@ def test_stage_presets_match_public_robottt_schedule():
     assert (stage1.max_steps, stage1.learning_rate, stage1.scheduler) == (
         30_000,
         2e-5,
-        "wsd",
+        SchedulerType.WARMUP_STABLE_DECAY.value,
     )
     assert (stage2.max_steps, stage2.learning_rate, stage2.scheduler) == (
         20_000,
@@ -257,10 +258,30 @@ def test_stage1_launcher_uses_wsd_and_honors_quick_overrides(tmp_path):
         )
     )
 
-    assert config.training.lr_scheduler_type == "wsd"
+    assert config.training.lr_scheduler_type == SchedulerType.WARMUP_STABLE_DECAY.value
     assert config.training.max_steps == 100
+    assert config.training.robottt_wsd_decay_steps == 10
     assert config.data.context_length == 128
     assert config.data.sequence_stride == 128
+
+
+def test_one_step_smoke_has_a_valid_wsd_schedule(tmp_path):
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text('{"episode_id": "ep-1"}\n')
+
+    config = build_robottt_config(
+        RoboTTTLaunchConfig(
+            stage="stage1",
+            base_model_path="public-groot",
+            dataset_path="robocasa365-lerobot",
+            manifest_path=str(manifest),
+            max_steps=1,
+            context_length=128,
+        )
+    )
+
+    assert config.training.warmup_ratio == 0
+    assert config.training.robottt_wsd_decay_steps == 1
 
 
 @pytest.mark.parametrize(

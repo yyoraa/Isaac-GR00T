@@ -114,6 +114,13 @@ def build_robottt_config(launch: RoboTTTLaunchConfig) -> Config:
     config.training.max_steps = launch.max_steps or preset.max_steps
     config.training.learning_rate = preset.learning_rate
     config.training.lr_scheduler_type = preset.scheduler
+    if launch.stage == "stage1" and launch.max_steps is not None:
+        config.training.robottt_wsd_decay_steps = min(
+            config.training.robottt_wsd_decay_steps,
+            max(1, config.training.max_steps // 10),
+        )
+        if config.training.max_steps == 1:
+            config.training.warmup_ratio = 0
     config.training.weight_decay = preset.weight_decay
     config.training.global_batch_size = launch.num_gpus
     config.training.gradient_accumulation_steps = launch.gradient_accumulation_steps

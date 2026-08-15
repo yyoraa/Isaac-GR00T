@@ -16,7 +16,7 @@ class RoboTTTTrainingConfig:
     stage: Literal["stage1", "stage2"]
     max_steps: int = 20_000
     learning_rate: float = 5e-5
-    scheduler: Literal["wsd", "cosine"] = "cosine"
+    scheduler: Literal["warmup_stable_decay", "cosine"] = "cosine"
     weight_decay: float = 1e-5
     context_length: int = 1024
     tbptt_steps: int = 128
@@ -41,7 +41,7 @@ class RoboTTTTrainingConfig:
                 stage="stage1",
                 max_steps=30_000,
                 learning_rate=2e-5,
-                scheduler="wsd",
+                scheduler="warmup_stable_decay",
                 context_length=8192,
             )
         if stage == "stage2":
