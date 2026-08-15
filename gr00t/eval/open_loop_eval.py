@@ -15,10 +15,11 @@
 
 from copy import deepcopy
 from dataclasses import dataclass, field
+import json
 import logging
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Literal
 import warnings
 
 from gr00t.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader
@@ -36,6 +37,8 @@ import tyro
 
 
 warnings.simplefilter("ignore", category=FutureWarning)
+
+EvaluationMode = Literal["base", "robottt_update_off", "robottt_full"]
 
 """
 Example commands:
@@ -131,6 +134,54 @@ def plot_trajectory_results(
 def parse_action_gr00t(action: dict[str, Any]) -> dict[str, Any]:
     # Unbatch and add prefix
     return {f"action.{key}": action[key][0] for key in action}
+
+
+def configure_robottt_evaluation_mode(policy: BasePolicy, mode: EvaluationMode) -> None:
+    """Configure online RoboTTT updates without changing checkpoint weights."""
+    if mode == "base":
+        return
+    action_head = getattr(getattr(policy, "model", None), "action_head", None)
+    setter = getattr(action_head, "set_robottt_online_updates", None)
+    if setter is None:
+        raise ValueError(f"Evaluation mode {mode!r} requires a local RoboTTT policy")
+    setter(mode == "robottt_full")
+
+
+def reset_policy_for_trajectory(policy: BasePolicy) -> None:
+    """Prevent fast state from leaking across episode boundaries."""
+    policy.reset()
+
+
+def write_evaluation_json(
+    path: str | Path,
+    config: "ArgsConfig",
+    per_trajectory: list[dict[str, int | float]],
+) -> Path:
+    """Write literal per-trajectory metrics and their arithmetic means."""
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    mse_values = [float(record["mse"]) for record in per_trajectory]
+    mae_values = [float(record["mae"]) for record in per_trajectory]
+    embodiment = getattr(config.embodiment_tag, "value", config.embodiment_tag)
+    payload = {
+        "mode": config.mode,
+        "checkpoint": config.model_path,
+        "dataset": config.dataset_path,
+        "embodiment_tag": embodiment,
+        "trajectory_ids": config.traj_ids,
+        "steps": config.steps,
+        "execution_horizon": config.execution_horizon,
+        "denoising_steps": config.denoising_steps,
+        "seed": config.seed,
+        "per_trajectory": per_trajectory,
+        "aggregate": {
+            "mse": float(np.mean(mse_values)) if mse_values else None,
+            "mae": float(np.mean(mae_values)) if mae_values else None,
+            "num_trajectories": len(per_trajectory),
+        },
+    }
+    output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return output
 
 
 def evaluate_single_trajectory(
@@ -272,11 +323,21 @@ class ArgsConfig:
     modality_keys: list[str] | None = None
     """List of modality keys to plot. If None, plot all keys."""
 
+    mode: EvaluationMode = "base"
+    """Base model, RoboTTT architecture without online updates, or full RoboTTT."""
+
+    output_json: str | None = None
+    """Optional path for machine-readable metrics."""
+
+    seed: int = 0
+    """Random seed shared by directly compared evaluation runs."""
+
 
 def main(args: ArgsConfig):
     args.embodiment_tag = EmbodimentTag.resolve(args.embodiment_tag)
     # Set up logging
     logging.basicConfig(level=logging.INFO)
+    np.random.seed(args.seed)
 
     # Download model checkpoint if it's an S3 path
     local_model_path = args.model_path
@@ -300,6 +361,8 @@ def main(args: ArgsConfig):
     if local_model_path is not None:
         import torch
 
+        torch.manual_seed(args.seed)
+
         policy = Gr00tPolicy(
             embodiment_tag=args.embodiment_tag,
             model_path=local_model_path,
@@ -319,6 +382,8 @@ def main(args: ArgsConfig):
                 args.denoising_steps,
             )
 
+    configure_robottt_evaluation_mode(policy, args.mode)
+
     # Get the supported modalities for the policy
     modality = policy.get_modality_config()
     logging.info(f"Current modality config: \n{modality}")
@@ -334,6 +399,7 @@ def main(args: ArgsConfig):
 
     all_mse = []
     all_mae = []
+    per_trajectory = []
 
     for traj_id in args.traj_ids:
         if traj_id >= len(dataset):
@@ -341,6 +407,7 @@ def main(args: ArgsConfig):
             continue
 
         logging.info(f"Running trajectory: {traj_id}")
+        reset_policy_for_trajectory(policy)
         mse, mae = evaluate_single_trajectory(
             policy,
             dataset,
@@ -354,6 +421,9 @@ def main(args: ArgsConfig):
         logging.info(f"MSE for trajectory {traj_id}: {mse}, MAE: {mae}")
         all_mse.append(mse)
         all_mae.append(mae)
+        per_trajectory.append(
+            {"trajectory_id": traj_id, "mse": float(mse), "mae": float(mae)}
+        )
 
     if all_mse:
         avg_mse = np.mean(np.array(all_mse))
@@ -362,6 +432,9 @@ def main(args: ArgsConfig):
         logging.info(f"Average MAE across all trajs: {avg_mae}")
     else:
         logging.info("No valid trajectories were evaluated.")
+    if args.output_json is not None:
+        output_path = write_evaluation_json(args.output_json, args, per_trajectory)
+        logging.info(f"Wrote evaluation metrics to {output_path}")
     logging.info("Done")
 
 
