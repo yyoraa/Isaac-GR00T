@@ -822,10 +822,27 @@ class Gr00tN1d7(PreTrainedModel):
 
         return backbone_inputs, action_inputs
 
+    @staticmethod
+    def _reshape_sequence_backbone_output(
+        backbone_output: BatchFeature,
+        batch_size: int,
+        trajectory_length: int,
+    ) -> BatchFeature:
+        """Restore the robot-time axes on flattened backbone outputs."""
+        flat_batch = batch_size * trajectory_length
+        for key, value in list(backbone_output.items()):
+            if isinstance(value, torch.Tensor) and value.shape[0] == flat_batch:
+                backbone_output[key] = value.reshape(
+                    batch_size, trajectory_length, *value.shape[1:]
+                )
+        return backbone_output
+
     def forward(
         self,
-        inputs: dict,
+        inputs: dict | None = None,
         robottt_state: RoboTTTState | None = None,
+        cached_backbone_output: BatchFeature | None = None,
+        cached_action_input: BatchFeature | None = None,
     ) -> BatchFeature:
         """
         Forward pass through the complete model.
@@ -837,6 +854,24 @@ class Gr00tN1d7(PreTrainedModel):
         Returns:
             BatchFeature containing loss and other outputs
         """
+        has_cached_backbone = cached_backbone_output is not None
+        has_cached_action = cached_action_input is not None
+        if has_cached_backbone != has_cached_action:
+            raise ValueError("cached_backbone_output and cached_action_input must be provided together")
+        if has_cached_backbone:
+            if inputs is not None:
+                raise ValueError("raw inputs and cached inputs are mutually exclusive")
+            if not self.config.robottt_enabled:
+                raise RuntimeError("cached forward requires robottt_enabled=True")
+            return self.action_head.forward_sequence(
+                cached_backbone_output,
+                cached_action_input,
+                robottt_state=robottt_state,
+                tbptt_steps=getattr(self.config, "robottt_tbptt_steps", 128),
+            )
+        if inputs is None:
+            raise ValueError("inputs are required when cached inputs are not provided")
+
         # Prepare inputs for backbone and action head
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         backbone_outputs = self.backbone(backbone_inputs)
@@ -844,12 +879,11 @@ class Gr00tN1d7(PreTrainedModel):
             batch_size, trajectory_length = [
                 int(value) for value in action_inputs.trajectory_shape.tolist()
             ]
-            flat_batch = batch_size * trajectory_length
-            for key, value in list(backbone_outputs.items()):
-                if isinstance(value, torch.Tensor) and value.shape[0] == flat_batch:
-                    backbone_outputs[key] = value.reshape(
-                        batch_size, trajectory_length, *value.shape[1:]
-                    )
+            self._reshape_sequence_backbone_output(
+                backbone_outputs,
+                batch_size,
+                trajectory_length,
+            )
             action_outputs = self.action_head.forward_sequence(
                 backbone_outputs,
                 action_inputs,
