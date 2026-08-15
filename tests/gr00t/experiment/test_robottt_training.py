@@ -242,6 +242,29 @@ def test_launcher_loads_frozen_stage1_base_in_bf16(tmp_path):
     assert config.model.robottt_compile_inner_update is True
 
 
+def test_stage1_launcher_preserves_effective_batch_across_eight_ranks(tmp_path):
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text('{"episode_id": "ep-1"}\n')
+
+    config = build_robottt_config(
+        RoboTTTLaunchConfig(
+            stage="stage1",
+            base_model_path="public-groot",
+            dataset_path="robocasa365-lerobot",
+            manifest_path=str(manifest),
+            num_gpus=8,
+            gradient_accumulation_steps=1,
+        )
+    )
+
+    assert config.training.num_gpus == 8
+    assert config.training.global_batch_size == 8
+    assert config.training.global_batch_size // config.training.num_gpus == 1
+    assert config.training.gradient_accumulation_steps == 1
+    assert config.training.accumulated_batch_size == 8
+    assert config.training.use_ddp is True
+
+
 def test_stage2_disables_frozen_backbone_cache_but_keeps_compiled_inner_update(tmp_path):
     manifest = tmp_path / "manifest.jsonl"
     manifest.write_text('{"episode_id": "ep-1"}\n')

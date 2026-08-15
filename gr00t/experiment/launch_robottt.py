@@ -28,6 +28,7 @@ class RoboTTTLaunchConfig:
     output_dir: str = "./outputs/robottt-robocasa365"
     experiment_name: str | None = None
     resume_from_checkpoint: bool = False
+    num_gpus: int = 1
     gradient_accumulation_steps: int = 8
     save_steps: int = 1_000
     save_total_limit: int = 5
@@ -107,7 +108,7 @@ def build_robottt_config(launch: RoboTTTLaunchConfig) -> Config:
     config.training.learning_rate = preset.learning_rate
     config.training.lr_scheduler_type = "cosine"
     config.training.weight_decay = preset.weight_decay
-    config.training.global_batch_size = 1
+    config.training.global_batch_size = launch.num_gpus
     config.training.gradient_accumulation_steps = launch.gradient_accumulation_steps
     config.training.gradient_checkpointing = preset.gradient_checkpointing
     config.training.optim = "adamw_torch"
@@ -117,7 +118,8 @@ def build_robottt_config(launch: RoboTTTLaunchConfig) -> Config:
     config.training.resume_from_checkpoint = launch.resume_from_checkpoint
     config.training.use_wandb = launch.use_wandb
     config.training.dataloader_num_workers = launch.dataloader_num_workers
-    config.training.num_gpus = 1
+    config.training.num_gpus = launch.num_gpus
+    config.training.use_ddp = launch.stage == "stage1" and launch.num_gpus > 1
     config.training.robottt_stage = launch.stage
     config.training.robottt_manifest_hash = _manifest_sha256(launch.manifest_path)
     config.training.robottt_curriculum_buckets = (
