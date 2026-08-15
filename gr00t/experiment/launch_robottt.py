@@ -36,6 +36,8 @@ class RoboTTTLaunchConfig:
     dataloader_num_workers: int = 0
     tbptt_steps: int = 1
     backbone_micro_batch_size: int = 8
+    max_steps: int | None = None
+    context_length: int | None = None
 
 
 def _manifest_sha256(path: str | Path) -> str:
@@ -85,6 +87,10 @@ def build_robottt_config(launch: RoboTTTLaunchConfig) -> Config:
         raise ValueError("tbptt_steps must be positive")
     if launch.backbone_micro_batch_size <= 0:
         raise ValueError("backbone_micro_batch_size must be positive")
+    if launch.max_steps is not None and launch.max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if launch.context_length is not None and launch.context_length <= 0:
+        raise ValueError("context_length must be positive")
     config.model.robottt_tbptt_steps = launch.tbptt_steps
     config.model.robottt_backbone_micro_batch_size = (
         launch.backbone_micro_batch_size if launch.stage == "stage1" else None
@@ -97,16 +103,17 @@ def build_robottt_config(launch: RoboTTTLaunchConfig) -> Config:
     config.model.use_relative_action = True
 
     config.data.sequence_mode = True
-    config.data.context_length = preset.context_length
-    config.data.sequence_stride = preset.context_length
+    context_length = launch.context_length or preset.context_length
+    config.data.context_length = context_length
+    config.data.sequence_stride = context_length
     config.data.tbptt_steps = launch.tbptt_steps
 
     config.training.start_from_checkpoint = launch.base_model_path
     config.training.output_dir = launch.output_dir
     config.training.experiment_name = launch.experiment_name
-    config.training.max_steps = preset.max_steps
+    config.training.max_steps = launch.max_steps or preset.max_steps
     config.training.learning_rate = preset.learning_rate
-    config.training.lr_scheduler_type = "cosine"
+    config.training.lr_scheduler_type = preset.scheduler
     config.training.weight_decay = preset.weight_decay
     config.training.global_batch_size = launch.num_gpus
     config.training.gradient_accumulation_steps = launch.gradient_accumulation_steps

@@ -242,6 +242,46 @@ def test_launcher_loads_frozen_stage1_base_in_bf16(tmp_path):
     assert config.model.robottt_compile_inner_update is True
 
 
+def test_stage1_launcher_uses_wsd_and_honors_quick_overrides(tmp_path):
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text('{"episode_id": "ep-1"}\n')
+
+    config = build_robottt_config(
+        RoboTTTLaunchConfig(
+            stage="stage1",
+            base_model_path="public-groot",
+            dataset_path="robocasa365-lerobot",
+            manifest_path=str(manifest),
+            max_steps=100,
+            context_length=128,
+        )
+    )
+
+    assert config.training.lr_scheduler_type == "wsd"
+    assert config.training.max_steps == 100
+    assert config.data.context_length == 128
+    assert config.data.sequence_stride == 128
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("max_steps", 0), ("context_length", 0)),
+)
+def test_launcher_rejects_nonpositive_quick_overrides(tmp_path, field, value):
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text('{"episode_id": "ep-1"}\n')
+
+    kwargs = {
+        "stage": "stage1",
+        "base_model_path": "public-groot",
+        "dataset_path": "robocasa365-lerobot",
+        "manifest_path": str(manifest),
+        field: value,
+    }
+    with pytest.raises(ValueError, match=field):
+        build_robottt_config(RoboTTTLaunchConfig(**kwargs))
+
+
 def test_stage1_launcher_preserves_effective_batch_across_eight_ranks(tmp_path):
     manifest = tmp_path / "manifest.jsonl"
     manifest.write_text('{"episode_id": "ep-1"}\n')
