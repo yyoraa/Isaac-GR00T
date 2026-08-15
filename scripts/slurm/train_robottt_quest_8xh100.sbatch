@@ -10,13 +10,13 @@
 #SBATCH --time=48:00:00
 #SBATCH --signal=B:USR1@300
 #SBATCH --requeue
-#SBATCH --output=/gpfs/home/qge0476/project/yiyun/robottt-quest/logs/robottt-8xh100-%j.out
-#SBATCH --error=/gpfs/home/qge0476/project/yiyun/robottt-quest/logs/robottt-8xh100-%j.err
+#SBATCH --output=/scratch/qge0476/robottt-quest/logs/robottt-8xh100-%j.out
+#SBATCH --error=/scratch/qge0476/robottt-quest/logs/robottt-8xh100-%j.err
 #SBATCH --open-mode=append
 
 set -euo pipefail
 
-quest_root="${ROBOTTT_QUEST_ROOT:-/gpfs/home/qge0476/project/yiyun/robottt-quest}"
+quest_root="${ROBOTTT_QUEST_ROOT:-/scratch/qge0476/robottt-quest}"
 repo_dir="${quest_root}/Isaac-GR00T"
 output_dir="${quest_root}/runs/stage1"
 torchrun_bin="${repo_dir}/.venv/bin/torchrun"
@@ -72,9 +72,9 @@ srun --kill-on-bad-exit=1 --label bash -lc '
     --master-port="${ROBOTTT_MASTER_PORT}" \
     gr00t/experiment/launch_robottt.py \
     --stage stage1 \
-    --base-model-path /gpfs/home/qge0476/project/yiyun/robottt-quest/models/GR00T-N1.7-3B \
-    --dataset-path /gpfs/home/qge0476/project/yiyun/robottt-quest/data/subset/pretrain:/gpfs/home/qge0476/project/yiyun/robottt-quest/data/subset/composite_seen:/gpfs/home/qge0476/project/yiyun/robottt-quest/data/subset/composite_unseen \
-    --manifest-path /gpfs/home/qge0476/project/yiyun/robottt-quest/data/subset/manifest.json \
+    --base-model-path /scratch/qge0476/robottt-quest/models/GR00T-N1.7-3B \
+    --dataset-path /scratch/qge0476/robottt-quest/data/subset/pretrain:/scratch/qge0476/robottt-quest/data/subset/composite_seen:/scratch/qge0476/robottt-quest/data/subset/composite_unseen \
+    --manifest-path /scratch/qge0476/robottt-quest/data/subset/manifest.json \
     --output-dir "${ROBOTTT_OUTPUT_DIR}" \
     --num-gpus 8 \
     --gradient-accumulation-steps 1 \

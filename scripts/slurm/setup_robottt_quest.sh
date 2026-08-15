@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-quest_root="${ROBOTTT_QUEST_ROOT:-/gpfs/home/qge0476/project/yiyun/robottt-quest}"
+quest_root="${ROBOTTT_QUEST_ROOT:-/scratch/qge0476/robottt-quest}"
 repo_dir="${ROBOTTT_REPO:-${quest_root}/Isaac-GR00T}"
 
 export UV_CACHE_DIR="${UV_CACHE_DIR:-${quest_root}/uv-cache}"
