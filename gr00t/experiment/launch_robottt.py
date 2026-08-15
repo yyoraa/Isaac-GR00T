@@ -83,8 +83,8 @@ def build_robottt_config(launch: RoboTTTLaunchConfig) -> Config:
         raise ValueError("tbptt_steps must be positive")
     config.model.robottt_tbptt_steps = launch.tbptt_steps
     config.model.model_name = "nvidia/Cosmos-Reason2-2B"
-    config.model.load_bf16 = False
-    config.model.backbone_trainable_params_fp32 = True
+    config.model.load_bf16 = launch.stage == "stage1"
+    config.model.backbone_trainable_params_fp32 = launch.stage == "stage2"
     config.model.use_relative_action = True
 
     config.data.sequence_mode = True

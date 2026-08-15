@@ -90,6 +90,13 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 state_dropout_prob=self.config.model.state_dropout_prob,
                 backbone_trainable_params_fp32=self.config.model.backbone_trainable_params_fp32,
                 load_bf16=self.config.model.load_bf16,
+                robottt_enabled=self.config.model.robottt_enabled,
+                robottt_num_register_tokens=self.config.model.robottt_num_register_tokens,
+                robottt_inner_dim=self.config.model.robottt_inner_dim,
+                robottt_inner_lr=self.config.model.robottt_inner_lr,
+                robottt_rope_theta=self.config.model.robottt_rope_theta,
+                robottt_gate_init=self.config.model.robottt_gate_init,
+                robottt_tbptt_steps=self.config.model.robottt_tbptt_steps,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
                 output_loading_info=True,
                 **self.transformers_loading_kwargs,
@@ -106,7 +113,19 @@ class Gr00tN1d7Pipeline(ModelPipeline):
 
             unexpected_keys = loading_info.get("unexpected_keys", [])
             mismatched_keys = loading_info.get("mismatched_keys", [])
-            other_missing = [k for k in missing_keys if "mask_token" not in k]
+            expected_robottt_missing = [
+                key for key in missing_keys if key.endswith("register_tokens") or ".robottt." in key
+            ]
+            if expected_robottt_missing:
+                logging.info(
+                    "Initialized %d new RoboTTT/register parameters not present in the base checkpoint",
+                    len(expected_robottt_missing),
+                )
+            other_missing = [
+                key
+                for key in missing_keys
+                if "mask_token" not in key and key not in expected_robottt_missing
+            ]
             errors = []
             if other_missing:
                 errors.append(f"Missing keys ({len(other_missing)}): {other_missing}")

@@ -164,6 +164,24 @@ def test_launcher_maps_stage2_to_full_tuning_and_single_gpu_zero3(tmp_path):
     assert config.training.deepspeed_config_path.endswith("robottt_zero3_offload.json")
     assert config.training.num_gpus == 1
     assert config.training.robottt_manifest_hash
+    assert config.model.load_bf16 is False
+    assert config.model.backbone_trainable_params_fp32 is True
+
+
+def test_launcher_loads_frozen_stage1_base_in_bf16(tmp_path):
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text('{"episode_id": "ep-1"}\n')
+    config = build_robottt_config(
+        RoboTTTLaunchConfig(
+            stage="stage1",
+            base_model_path="public-groot",
+            dataset_path="robocasa365-lerobot",
+            manifest_path=str(manifest),
+        )
+    )
+
+    assert config.model.load_bf16 is True
+    assert config.model.backbone_trainable_params_fp32 is False
 
 
 def test_trajectory_sampler_state_restores_exact_next_shard():
