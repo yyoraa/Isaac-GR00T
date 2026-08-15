@@ -1,4 +1,6 @@
+from contextlib import nullcontext
 import json
+from types import SimpleNamespace
 
 from gr00t.configs.robottt_training import (
     RoboTTTTrainingConfig,
@@ -15,6 +17,7 @@ from gr00t.experiment.robottt_trainer import (
     RoboTTTTrainer,
 )
 from gr00t.experiment.trainer import Gr00tTrainer
+import pytest
 import torch
 from torch import nn
 from transformers.feature_extraction_utils import BatchFeature
@@ -292,3 +295,144 @@ def test_tbptt_slicer_preserves_temporal_and_flat_vlm_alignment():
     assert segment["input_ids"].flatten().tolist() == [1, 2]
     assert segment["pixel_values"].flatten().tolist() == [2, 3, 4, 5]
     assert segment["episode_id"].tolist() == [9]
+
+
+class _GenerationState:
+    def __init__(self, generation):
+        self.generation = generation
+
+    def detach(self):
+        return _GenerationState(self.generation + 1)
+
+
+class _CountingFrozenBackbone(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.anchor = nn.Parameter(torch.zeros(()), requires_grad=False)
+        self.calls = []
+
+    def forward(self, inputs):
+        ids = inputs.input_ids
+        self.calls.append(ids.flatten().tolist())
+        batch = ids.shape[0]
+        return BatchFeature(
+            data={
+                "backbone_features": ids.float().reshape(batch, 1, 1),
+                "backbone_attention_mask": torch.ones(batch, 1, dtype=torch.bool),
+                "image_mask": torch.zeros(batch, 1, dtype=torch.bool),
+            }
+        )
+
+
+class _CachedTrainingModel(nn.Module):
+    def __init__(self, micro_batch_size=3):
+        super().__init__()
+        self.config = SimpleNamespace(
+            robottt_tbptt_steps=1,
+            robottt_backbone_micro_batch_size=micro_batch_size,
+        )
+        self.backbone = _CountingFrozenBackbone()
+        self.scale = nn.Parameter(torch.tensor(1.0))
+        self.action_calls = []
+
+    def prepare_input(self, payload):
+        backbone = BatchFeature(data={"input_ids": payload["input_ids"]})
+        action = BatchFeature(
+            data={
+                "trajectory_shape": payload["trajectory_shape"],
+                "state": payload["state"],
+            }
+        )
+        return backbone, action
+
+    @staticmethod
+    def _reshape_sequence_backbone_output(output, batch_size, trajectory_length):
+        flat_batch = batch_size * trajectory_length
+        for key, value in list(output.items()):
+            if isinstance(value, torch.Tensor) and value.shape[0] == flat_batch:
+                output[key] = value.reshape(batch_size, trajectory_length, *value.shape[1:])
+        return output
+
+    def forward(
+        self,
+        inputs=None,
+        robottt_state=None,
+        cached_backbone_output=None,
+        cached_action_input=None,
+    ):
+        if cached_backbone_output is None or cached_action_input is None:
+            raise AssertionError("cached training must use the cached model branch")
+        position = int(cached_action_input.state.flatten()[0])
+        prior_generation = None if robottt_state is None else robottt_state.generation
+        self.action_calls.append((position, prior_generation))
+        next_generation = 10 if robottt_state is None else robottt_state.generation + 10
+        return BatchFeature(
+            data={
+                "loss": self.scale * (position + 1),
+                "robottt_state": _GenerationState(next_generation),
+            }
+        )
+
+
+class _TestAccelerator:
+    distributed_type = SimpleNamespace(value="NO")
+
+    def __init__(self):
+        self.backward_calls = 0
+
+    def unwrap_model(self, model):
+        return model
+
+    def backward(self, loss, **_kwargs):
+        self.backward_calls += 1
+        loss.backward()
+
+
+def _cached_trainer():
+    trainer = object.__new__(RoboTTTTrainer)
+    trainer.args = SimpleNamespace(device=torch.device("cpu"))
+    trainer.current_gradient_accumulation_steps = 1
+    trainer.accelerator = _TestAccelerator()
+    trainer.compute_loss_context_manager = nullcontext
+    trainer._prepare_inputs = lambda value: value
+    return trainer
+
+
+def _seven_step_inputs():
+    return {
+        "inputs": {
+            "trajectory_shape": torch.tensor([1, 7]),
+            "input_ids": torch.arange(7).reshape(7, 1),
+            "state": torch.arange(7).reshape(1, 7, 1),
+        }
+    }
+
+
+def test_cached_backbone_is_micro_batched_once_then_consumed_in_order():
+    trainer = _cached_trainer()
+    model = _CachedTrainingModel(micro_batch_size=3)
+
+    loss = trainer.training_step(model, _seven_step_inputs())
+
+    assert model.backbone.calls == [[0, 1, 2], [3, 4, 5], [6]]
+    assert model.action_calls == [
+        (0, None),
+        (1, 11),
+        (2, 22),
+        (3, 33),
+        (4, 44),
+        (5, 55),
+        (6, 66),
+    ]
+    torch.testing.assert_close(loss, torch.tensor(4.0))
+    torch.testing.assert_close(model.scale.grad, torch.tensor(4.0))
+    assert trainer.accelerator.backward_calls == 7
+
+
+def test_cached_backbone_rejects_trainable_parameters():
+    trainer = _cached_trainer()
+    model = _CachedTrainingModel(micro_batch_size=3)
+    model.backbone.anchor.requires_grad_(True)
+
+    with pytest.raises(RuntimeError, match="requires a fully frozen backbone"):
+        trainer.training_step(model, _seven_step_inputs())

@@ -12,6 +12,7 @@ from typing import Any
 import torch
 from transformers.trainer import get_last_checkpoint
 from transformers.trainer_callback import TrainerCallback
+from transformers.feature_extraction_utils import BatchFeature
 
 from gr00t.configs.robottt_training import build_wsd_scheduler
 from gr00t.experiment.trainer import Gr00tTrainer
@@ -122,6 +123,27 @@ class RoboTTTTrainer(Gr00tTrainer):
             self._created_lr_scheduler = True
         return self.lr_scheduler
 
+    def compute_loss(
+        self,
+        model,
+        inputs,
+        return_outputs: bool = False,
+        num_items_in_batch: int | None = None,
+    ):
+        payload = inputs.get("inputs", {})
+        if "trajectory_shape" not in payload:
+            return super().compute_loss(
+                model,
+                inputs,
+                return_outputs=return_outputs,
+                num_items_in_batch=num_items_in_batch,
+            )
+
+        outputs = model(**inputs)
+        loss = outputs["loss"]
+        self.loss = loss
+        return (loss, outputs) if return_outputs else loss
+
     @staticmethod
     def _slice_trajectory_inputs(inputs: dict[str, Any], start: int, end: int) -> dict[str, Any]:
         payload = inputs["inputs"]
@@ -164,6 +186,19 @@ class RoboTTTTrainer(Gr00tTrainer):
             return super().training_step(model, inputs, num_items_in_batch)
 
         model.train()
+        micro_batch_size = getattr(
+            model.config,
+            "robottt_backbone_micro_batch_size",
+            None,
+        )
+        if micro_batch_size is not None:
+            return self._training_step_with_cached_backbone(
+                model,
+                inputs,
+                num_items_in_batch=num_items_in_batch,
+                micro_batch_size=int(micro_batch_size),
+            )
+
         inputs = self._prepare_inputs(inputs)
         _, trajectory_length = [int(value) for value in inputs["inputs"]["trajectory_shape"]]
         segment_length = int(getattr(model.config, "robottt_tbptt_steps", 1))
@@ -188,6 +223,99 @@ class RoboTTTTrainer(Gr00tTrainer):
             self.accelerator.backward(scaled_loss, **kwargs)
             reported_loss = reported_loss + loss.detach() * weight
             fast_state = outputs.robottt_state.detach()
+        return reported_loss
+
+    @staticmethod
+    def _slice_cached_backbone_output(
+        output: BatchFeature,
+        start: int,
+        end: int,
+        batch_size: int,
+        trajectory_length: int,
+    ) -> BatchFeature:
+        sliced = {}
+        for key, value in output.items():
+            if (
+                isinstance(value, torch.Tensor)
+                and value.ndim >= 2
+                and tuple(value.shape[:2]) == (batch_size, trajectory_length)
+            ):
+                sliced[key] = value[:, start:end]
+            else:
+                sliced[key] = value
+        return BatchFeature(data=sliced)
+
+    def _training_step_with_cached_backbone(
+        self,
+        model,
+        inputs,
+        *,
+        num_items_in_batch=None,
+        micro_batch_size: int,
+    ):
+        if micro_batch_size <= 0:
+            raise ValueError("robottt_backbone_micro_batch_size must be positive")
+        unwrapped_model = self.accelerator.unwrap_model(model)
+        if any(parameter.requires_grad for parameter in unwrapped_model.backbone.parameters()):
+            raise RuntimeError("cached RoboTTT training requires a fully frozen backbone")
+
+        payload = inputs["inputs"]
+        batch_size, trajectory_length = [int(value) for value in payload["trajectory_shape"]]
+        tbptt_steps = int(getattr(model.config, "robottt_tbptt_steps", 1))
+        if tbptt_steps != 1:
+            raise ValueError("cached RoboTTT training currently requires robottt_tbptt_steps=1")
+        chunk_length = max(1, micro_batch_size // batch_size)
+        fast_state = None
+        reported_loss = torch.zeros((), device=self.args.device)
+
+        for chunk_start in range(0, trajectory_length, chunk_length):
+            chunk_end = min(chunk_start + chunk_length, trajectory_length)
+            raw_chunk = self._slice_trajectory_inputs(inputs, chunk_start, chunk_end)
+            prepared_chunk = self._prepare_inputs(raw_chunk)
+            backbone_inputs, action_inputs = unwrapped_model.prepare_input(
+                prepared_chunk["inputs"]
+            )
+            current_chunk_length = chunk_end - chunk_start
+            with self.compute_loss_context_manager(), torch.no_grad():
+                backbone_outputs = unwrapped_model.backbone(backbone_inputs)
+            unwrapped_model._reshape_sequence_backbone_output(
+                backbone_outputs,
+                batch_size,
+                current_chunk_length,
+            )
+
+            for local_start in range(current_chunk_length):
+                local_end = local_start + 1
+                cached_backbone = self._slice_cached_backbone_output(
+                    backbone_outputs,
+                    local_start,
+                    local_end,
+                    batch_size,
+                    current_chunk_length,
+                )
+                cached_action = BatchFeature(
+                    data=self._slice_trajectory_inputs(
+                        {"inputs": action_inputs},
+                        local_start,
+                        local_end,
+                    )["inputs"]
+                )
+                with self.compute_loss_context_manager():
+                    outputs = model(
+                        cached_backbone_output=cached_backbone,
+                        cached_action_input=cached_action,
+                        robottt_state=fast_state,
+                    )
+                    loss = outputs["loss"]
+                weight = 1.0 / trajectory_length
+                scaled_loss = loss * weight / self.current_gradient_accumulation_steps
+                kwargs = {}
+                if self.accelerator.distributed_type.value == "DEEPSPEED":
+                    kwargs["scale_wrt_gas"] = False
+                self.accelerator.backward(scaled_loss, **kwargs)
+                reported_loss = reported_loss + loss.detach() * weight
+                fast_state = outputs.robottt_state.detach()
+
         return reported_loss
 
     def save_robottt_state(self, global_step: int) -> None:
@@ -225,4 +353,6 @@ class RoboTTTTrainer(Gr00tTrainer):
             if hasattr(self.train_dataset, "load_state_dict"):
                 self.train_dataset.load_state_dict(state.sampler_state)
             self.apply_curriculum(state.global_step)
+        else:
+            self.apply_curriculum(0)
         return super().train(resume_from_checkpoint=resume_from_checkpoint, **kwargs)
