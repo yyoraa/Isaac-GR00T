@@ -171,12 +171,16 @@ def _run_step_and_backward(layer, tokens, positions, update_mask):
 def test_analytic_inner_update_matches_autograd_reference():
     torch.manual_seed(19)
     reference = RoboTTTLayer(dim=4, inner_dim=7, gate_init=0.2).double().train()
-    analytic = RoboTTTLayer(
-        dim=4,
-        inner_dim=7,
-        gate_init=0.2,
-        analytic_inner_update=True,
-    ).double().train()
+    analytic = (
+        RoboTTTLayer(
+            dim=4,
+            inner_dim=7,
+            gate_init=0.2,
+            analytic_inner_update=True,
+        )
+        .double()
+        .train()
+    )
     analytic.load_state_dict(reference.state_dict())
     tokens = torch.randn(2, 3, 4, dtype=torch.float64)
     positions = torch.tensor([2, 5])
@@ -200,12 +204,16 @@ def test_analytic_inner_update_matches_autograd_reference():
 def test_analytic_outer_gradients_match_autograd_reference():
     torch.manual_seed(29)
     reference = RoboTTTLayer(dim=4, inner_dim=7, gate_init=0.2).double().train()
-    analytic = RoboTTTLayer(
-        dim=4,
-        inner_dim=7,
-        gate_init=0.2,
-        analytic_inner_update=True,
-    ).double().train()
+    analytic = (
+        RoboTTTLayer(
+            dim=4,
+            inner_dim=7,
+            gate_init=0.2,
+            analytic_inner_update=True,
+        )
+        .double()
+        .train()
+    )
     analytic.load_state_dict(reference.state_dict())
     tokens = torch.randn(2, 3, 4, dtype=torch.float64)
     positions = torch.tensor([2, 5])
@@ -233,7 +241,10 @@ def test_analytic_all_masked_step_preserves_state_bitwise():
         update_mask=torch.tensor([False, False]),
     )
 
-    assert all(torch.equal(actual, expected) for actual, expected in zip(updated.tensors(), state.tensors()))
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(updated.tensors(), state.tensors())
+    )
     assert metrics["num_updates"].item() == 0
 
 
@@ -246,12 +257,16 @@ def test_compile_inner_update_requires_analytic_backend():
 def test_compiled_inner_update_matches_eager_analytic_backend():
     torch.manual_seed(37)
     eager = RoboTTTLayer(dim=4, inner_dim=7, analytic_inner_update=True).cuda().train()
-    compiled = RoboTTTLayer(
-        dim=4,
-        inner_dim=7,
-        analytic_inner_update=True,
-        compile_inner_update=True,
-    ).cuda().train()
+    compiled = (
+        RoboTTTLayer(
+            dim=4,
+            inner_dim=7,
+            analytic_inner_update=True,
+            compile_inner_update=True,
+        )
+        .cuda()
+        .train()
+    )
     compiled.load_state_dict(eager.state_dict())
     tokens = torch.randn(2, 3, 4, device="cuda")
     positions = torch.tensor([1, 4], device="cuda")

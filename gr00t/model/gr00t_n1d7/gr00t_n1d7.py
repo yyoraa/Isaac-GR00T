@@ -857,7 +857,9 @@ class Gr00tN1d7(PreTrainedModel):
         has_cached_backbone = cached_backbone_output is not None
         has_cached_action = cached_action_input is not None
         if has_cached_backbone != has_cached_action:
-            raise ValueError("cached_backbone_output and cached_action_input must be provided together")
+            raise ValueError(
+                "cached_backbone_output and cached_action_input must be provided together"
+            )
         if has_cached_backbone:
             if inputs is not None:
                 raise ValueError("raw inputs and cached inputs are mutually exclusive")

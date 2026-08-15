@@ -42,9 +42,7 @@ def _analytic_fast_mlp_step(
     per_example_loss = residual.square().mean(dim=(1, 2))
 
     scale = 2.0 / (prediction.shape[1] * prediction.shape[2])
-    grad_prediction = (
-        residual * scale * update_mask.to(residual.dtype).reshape(-1, 1, 1)
-    )
+    grad_prediction = residual * scale * update_mask.to(residual.dtype).reshape(-1, 1, 1)
     grad_w2 = torch.einsum("bnh,bnd->bhd", hidden, grad_prediction)
     grad_b2 = grad_prediction.sum(dim=1)
     grad_hidden = torch.einsum("bnd,bhd->bnh", grad_prediction, w2)
@@ -57,24 +55,16 @@ def _analytic_fast_mlp_step(
 
     previous = (w1, b1, w2, b2)
     candidates = tuple(
-        parameter - step_size * gradient
-        for parameter, gradient in zip(previous, gradients)
+        parameter - step_size * gradient for parameter, gradient in zip(previous, gradients)
     )
     updated = []
     for candidate, old_value in zip(candidates, previous):
-        broadcast_mask = update_mask.reshape(
-            update_mask.shape[0], *([1] * (candidate.ndim - 1))
-        )
+        broadcast_mask = update_mask.reshape(update_mask.shape[0], *([1] * (candidate.ndim - 1)))
         updated.append(torch.where(broadcast_mask, candidate, old_value))
 
     updated_w1, updated_b1, updated_w2, updated_b2 = updated
-    adapted_hidden = F.gelu(
-        torch.einsum("bnd,bdh->bnh", query, updated_w1) + updated_b1[:, None]
-    )
-    adapted = (
-        torch.einsum("bnh,bhd->bnd", adapted_hidden, updated_w2)
-        + updated_b2[:, None]
-    )
+    adapted_hidden = F.gelu(torch.einsum("bnd,bdh->bnh", query, updated_w1) + updated_b1[:, None])
+    adapted = torch.einsum("bnh,bhd->bnd", adapted_hidden, updated_w2) + updated_b2[:, None]
     return adapted, tuple(updated), per_example_loss
 
 

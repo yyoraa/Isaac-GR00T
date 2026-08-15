@@ -10,9 +10,9 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from transformers.feature_extraction_utils import BatchFeature
 from transformers.trainer import get_last_checkpoint
 from transformers.trainer_callback import TrainerCallback
-from transformers.feature_extraction_utils import BatchFeature
 
 from gr00t.configs.robottt_training import build_wsd_scheduler
 from gr00t.experiment.trainer import Gr00tTrainer
@@ -272,9 +272,7 @@ class RoboTTTTrainer(Gr00tTrainer):
             chunk_end = min(chunk_start + chunk_length, trajectory_length)
             raw_chunk = self._slice_trajectory_inputs(inputs, chunk_start, chunk_end)
             prepared_chunk = self._prepare_inputs(raw_chunk)
-            backbone_inputs, action_inputs = unwrapped_model.prepare_input(
-                prepared_chunk["inputs"]
-            )
+            backbone_inputs, action_inputs = unwrapped_model.prepare_input(prepared_chunk["inputs"])
             current_chunk_length = chunk_end - chunk_start
             with self.compute_loss_context_manager(), torch.no_grad():
                 backbone_outputs = unwrapped_model.backbone(backbone_inputs)

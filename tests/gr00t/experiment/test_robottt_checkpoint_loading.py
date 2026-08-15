@@ -42,9 +42,7 @@ def _pipeline(tmp_path):
     return pipeline
 
 
-def test_checkpoint_load_enables_robottt_without_overriding_checkpoint_depth(
-    monkeypatch, tmp_path
-):
+def test_checkpoint_load_enables_robottt_without_overriding_checkpoint_depth(monkeypatch, tmp_path):
     captured = {}
     model = nn.Module()
     model.anchor = nn.Parameter(torch.zeros(()))
